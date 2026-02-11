@@ -12,91 +12,101 @@ las main.
 """
 #!/usr/bin/env python3
 import argparse
-import sys
 import os
-import subprocess
-import migration
-import database as db
-import hashlib
-
-
-def calculate_hash(path, sectors):
-    sha256 = hashlib.sha256()
-    bytes_to_read = int(sectors) * 512
-    chunk = 1024 * 1024
-    with open(path, "rb") as f:
-        read = 0
-        while read < bytes_to_read:
-            data = f.read(min(chunk, bytes_to_read - read))
-            if not data:
-                break
-            sha256.update(data)
-            read += len(data)
-    return sha256.hexdigest()
-
-
-def update_boot_environment():
-    print("Regenerating boot configurations...")
-    try:
-        if os.path.exists("/etc/debian_version"):
-            subprocess.run(["update-initramfs", "-u"], check=True)
-            subprocess.run(["update-grub"], check=True)
-        else:
-            subprocess.run(["dracut", "-f"], check=True)
-            subprocess.run(["grub2-mkconfig", "-o", "/boot/grub2/grub.cfg"], check=True)
-    except Exception as e:
-        print(f"Warning: Boot update failed: {e}")
+import sys
+import dm
+import database
 
 
 def main():
-    parser = argparse.ArgumentParser(description="LAS: Lift and Shift (EXPERIMENTAL)")
+    if os.geteuid() != 0:
+        print("Error: Root privileges required.")
+        sys.exit(1)
+
+    database.init_db()
+    parser = argparse.ArgumentParser(description="LAS: LUN Migration Utility")
     subparsers = parser.add_subparsers(dest="command")
 
-    p_cmd = subparsers.add_parser("pair")
-    p_cmd.add_argument("--name", required=True)
-    p_cmd.add_argument("--origin", required=True)
-    p_cmd.add_argument("--dest", required=True)
-    p_cmd.add_argument("--boot", action="store_true")
+    # Command: activate
+    act = subparsers.add_parser("activate", help="Adopt LUNs into a passive mirror")
+    act.add_argument("--orig", required=True)
+    act.add_argument("--dest", required=True)
+    act.add_argument("--meta_orig", required=True)
+    act.add_argument("--meta_dest", required=True)
+    act.add_argument("--throttle", type=int)
+    act.add_argument("--name", default="las_migration")
 
-    subparsers.add_parser("status").add_argument("--name", required=True)
-    subparsers.add_parser("list")
-    subparsers.add_parser("verify").add_argument("--name", required=True)
-    subparsers.add_parser("finish").add_argument("--name", required=True)
+    subparsers.add_parser("sync", help="Start background synchronization").add_argument(
+        "--name", default="las_migration"
+    )
+    subparsers.add_parser("status", help="Check synchronization status").add_argument(
+        "--name", default="las_migration"
+    )
+    subparsers.add_parser("break", help="Cut over to destination device").add_argument(
+        "--name", default="las_migration"
+    )
+    subparsers.add_parser("list", help="List all migration tasks").add_argument(
+        "--name", default="las_migration"
+    )
+    subparsers.add_parser("delete", help="Delete a migration task").add_argument(
+        "--name", default="las_migration"
+    )
+
+    if len(sys.argv) == 1:
+        parser.print_help()
+        sys.exit(0)
 
     args = parser.parse_args()
-    db.init_db()
+    engine = dm.RAIDEngine(args.name)
 
-    if os.getuid() != 0:
-        sys.exit("Error: Root privileges required.")
+    if args.command == "activate":
+        if engine.activate_passive(
+            args.orig, args.dest, args.meta_orig, args.meta_dest
+        ):
+            database.record_migration(
+                args.name,
+                args.orig,
+                args.dest,
+                args.meta_orig,
+                args.meta_dest,
+                args.throttle,
+                active=False,
+            )
+            print(f"[SUCCESS] {args.name} established in passive mode (no sync).")
 
-    if args.command == "pair":
-        if not migration.check_dependencies(args.boot):
-            sys.exit(1)
-        engine = migration.get_engine(args.boot)
-        if engine.pair(args.name, args.origin, args.dest):
-            pair_obj = db.LunPair(args.name, args.origin, args.dest)
-            pair_obj.is_boot = args.boot
-            db.save_pair(pair_obj)
-            if args.boot:
-                update_boot_environment()
-            print(f"Pair '{args.name}' established.")
+    elif args.command == "sync":
+        rec = database.get_migration(args.name)
+        if rec and engine.start_sync(*rec):
+            database.record_migration(args.name, *rec, active=True)
+            print(f"[SUCCESS] Background synchronization initiated.")
 
     elif args.command == "status":
-        p = db.get_pair(args.name)
-        engine = migration.get_engine(p.is_boot if p else False)
-        print(f"Sync Progress: {engine.get_status(args.name)}")
+        raw, pct = engine.get_status()
+        if pct:
+            print(f"Status for {args.name} sync : {pct}")
 
-    elif args.command == "verify":
-        p = db.get_pair(args.name)
-        if not p:
-            sys.exit("Pair not found.")
-        size = (
-            subprocess.check_output(["blockdev", "--getsz", p.origin]).decode().strip()
-        )
-        print("Calculating hashes...")
-        h1 = calculate_hash(p.origin, size)
-        h2 = calculate_hash(p.destination, size)
-        print(f"Origin: {h1}\nDest:   {h2}\nMatch:  {h1 == h2}")
+    elif args.command == "break":
+        raw, pct = engine.get_status()
+        if pct != "100.00%":
+            print(f"WARNING: Sync is incomplete ({pct}).")
+            confirm = input(
+                "Confirm break (data on destination may be partial)? (y/N): "
+            )
+            if confirm.lower() != "y":
+                sys.exit(0)
+        engine.stop()
+        rec = database.get_migration(args.name)
+
+        database.mark_complete(args.name)
+        print(f"[SUCCESS] Finalized. {args.name} is now a linear device on {rec[1]}.")
+
+    elif args.command == "list":
+        with database.sqlite3.connect(database.DB_PATH) as conn:
+            for row in conn.execute("SELECT * FROM migrations"):
+                print(row)
+    elif args.command == "delete":
+        database.delete_migration(args.name)
+        print(f"[SUCCESS] Deleted migration record for {args.name}.")
 
 
 if __name__ == "__main__":

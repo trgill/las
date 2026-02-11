@@ -11,53 +11,62 @@
 database interactions.
 """
 import sqlite3
-import pickle
 import os
 
-DB_PATH = "/etc/las.db"
-
-
-class LunPair:
-    def __init__(self, name, origin, destination):
-        self.name = name
-        self.origin = origin
-        self.destination = destination
-        self.is_boot = False
-
+DB_PATH = "/var/lib/las/migrations.db"
 
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("CREATE TABLE IF NOT EXISTS pairs (name TEXT PRIMARY KEY, data BLOB)")
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS migrations (
+                name TEXT PRIMARY KEY, 
+                origin TEXT NOT NULL, 
+                target TEXT NOT NULL,
+                meta_orig TEXT NOT NULL, 
+                meta_dest TEXT NOT NULL,
+                throttle INTEGER, 
+                status TEXT DEFAULT 'nosync'
+            )
+        """
+        )
+        conn.commit()
 
 
-def save_pair(pair):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        "INSERT OR REPLACE INTO pairs VALUES (?, ?)", (pair.name, pickle.dumps(pair))
-    )
-    conn.commit()
-    conn.close()
+def record_migration(name, orig, dest, m_orig, m_dest, throttle, active=True):
+    status = "active" if active else "nosync"
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            REPLACE INTO migrations (name, origin, target, meta_orig, meta_dest, throttle, status) 
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+            (name, orig, dest, m_orig, m_dest, throttle, status),
+        )
+        conn.commit()
 
 
-def get_pair(name):
-    conn = sqlite3.connect(DB_PATH)
-    row = conn.execute("SELECT data FROM pairs WHERE name = ?", (name,)).fetchone()
-    conn.close()
-    return pickle.loads(row[0]) if row else None
+def get_migration(name):
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT origin, target, meta_orig, meta_dest, throttle FROM migrations WHERE name=?",
+            (name,),
+        )
+        return cursor.fetchone()
 
 
-def list_all_pairs():
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute("SELECT data FROM pairs").fetchall()
-    conn.close()
-    return [pickle.loads(r[0]) for r in rows]
+def mark_complete(name):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("UPDATE migrations SET status='completed' WHERE name=?", (name,))
+        conn.commit()
 
 
-def delete_pair_from_db(name):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("DELETE FROM pairs WHERE name = ?", (name,))
-    conn.commit()
-    conn.close()
+def delete_migration(name):
+    """Removes the migration record entirely from the database."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM migrations WHERE name=?", (name,))
+        conn.commit()
