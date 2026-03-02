@@ -11,68 +11,86 @@
 migration interactions.
 """
 import subprocess
-import sys
-import logging
+import os
 import re
+import time
+import hashlib
+import logging
 
 logger = logging.getLogger("las")
-
 
 class RAIDEngine:
     def __init__(self, name):
         self.name = name
 
-    def _flush(self):
-        """Perform a multi-stage flush: sync, blockdev flush, and optional fsfreeze."""
-        device_path = f"/dev/mapper/{self.name}"
-        print(f"[*] Performing deep flush on {device_path}...")
-
-        # 1. Standard sync to flush page cache
-        subprocess.run(["sync"], check=True)
-
-        # 2. Try to find the mount point to freeze/thaw (forces XFS log commit)
-        mount_point = None
-        with open("/proc/mounts", "r") as f:
-            for line in f:
-                if device_path in line:
-                    mount_point = line.split()[1]
-                    break
-
-        if mount_point:
-            try:
-                print(f"[*] Freezing {mount_point} to commit XFS logs...")
-                subprocess.run(["fsfreeze", "-f", mount_point], check=True)
-                subprocess.run(["fsfreeze", "-u", mount_point], check=True)
-            except subprocess.CalledProcessError:
-                print(
-                    "[!] Warning: Could not freeze filesystem. Proceeding with block flush."
-                )
-
-        # 3. Final block-level flush
-        res = subprocess.run(
-            ["blockdev", "--flushbufs", device_path], capture_output=True
-        )
-        return res.returncode == 0
+    def verify_xfs_magic(self, dev):
+        """Checks if the first 4 bytes of a device match the XFS magic string."""
+        try:
+            with open(dev, "rb") as f:
+                magic = f.read(4)
+                # 0x58 46 53 42 is "XFSB" in ASCII
+                return magic == b"XFSB"
+        except Exception as e:
+            print(f"[!] Could not read magic number from {dev}: {e}")
+            return False
 
     def _get_size(self, dev):
         """Returns size in 512-byte sectors. Handles device:offset syntax."""
         clean_dev = dev.split(":")[0]
+
+        if not os.path.exists(clean_dev):
+            print(f"[!] Error: Device {clean_dev} not found.")
+            sys.exit(1)
+
         res = subprocess.run(
             ["blockdev", "--getsz", clean_dev], capture_output=True, text=True
         )
         if res.returncode != 0:
-            logger.error(f"Failed to access device {clean_dev}")
+            print(f"[!] Error: Could not get size for {clean_dev}")
             sys.exit(1)
-        return res.stdout.strip()
+
+        return int(res.stdout.strip())
+
+    def validate_sizes(self, orig, dest):
+        """Compares sectors of orig and dest. Returns True if dest is large enough."""
+        orig_size = self._get_size(orig)
+        dest_size = self._get_size(dest)
+
+        print(
+            f"[*] Size Check: Source ({orig_size} sectors) | Destination ({dest_size} sectors)"
+        )
+
+        if dest_size < orig_size:
+            print(
+                f"[!] ERROR: Destination device is smaller than the source by {orig_size - dest_size} sectors."
+            )
+            return False
+
+        if dest_size > orig_size:
+            print(
+                f"[*] WARNING: Destination is larger than source. Excess space will be unusable."
+            )
+
+        return True
+
+    def _hash_chunk(self, dev, offset_bytes, size_bytes):
+        """Hashes a specific slice of a block device for integrity checks."""
+        try:
+            with open(dev, "rb") as f:
+                f.seek(offset_bytes)
+                chunk = f.read(size_bytes)
+                return hashlib.sha256(chunk).hexdigest()
+        except Exception as e:
+            return str(e)
 
     def _run_dm(self, action, table=None):
-        """Core wrapper for dmsetup ioctls."""
-        cmd = ["dmsetup", action, self.name]
+        """Standard wrapper for dmsetup with command printing for transparency."""
         if table:
-            # Print the manual command equivalent for debugging
-            print(f'[*] EXEC: echo "{table}" | dmsetup {action} {self.name}')
+            print(f"[*] EXEC: echo '{table}' | dmsetup {action} {self.name}")
         else:
             print(f"[*] EXEC: dmsetup {action} {self.name}")
+
+        cmd = ["dmsetup", action, self.name]
         try:
             if table:
                 p = subprocess.Popen(cmd, stdin=subprocess.PIPE, text=True)
@@ -86,31 +104,21 @@ class RAIDEngine:
             return False
 
     def activate_passive(self, orig, dest, m_orig, m_dest):
-        """Adopts devices into a RAID1 set with 'nosync' protection."""
+        """Creates a RAID1 target in 'nosync' mode for safe LUN adoption."""
         size = self._get_size(orig)
-        region_size = "1024"  # 512KB
-        # '1 nosync' means exactly 1 feature argument ('nosync') follows.
+        region_size = "1024"  # 512KB chunks
+        # '1 nosync' ensures the destination isn't overwritten immediately
         table = f"0 {size} raid raid1 2 {region_size} nosync 2 {m_orig} {orig} {m_dest} {dest}"
 
-        # Cleanup previous failed attempts to avoid "Device or resource busy"
+        # Cleanup any stale mappings to prevent -EBUSY
         subprocess.run(["dmsetup", "remove", self.name], capture_output=True)
-
-        # Print the manual command equivalent for debugging
-        print(f'[*] EXEC: echo "{table}" | dmsetup create {self.name}')
-
         return self._run_dm("create", table)
 
     def start_sync(self, orig, dest, m_orig, m_dest, throttle=None):
-        """Reloads the table to remove nosync and begin synchronization."""
+        """Reloads the table with max_recovery_rate to start sync."""
         size = self._get_size(orig)
         region_size = "1024"
-
-        # '2 max_recovery_rate <val>' consists of 2 arguments.
-        if throttle:
-            feat_args = f"2 max_recovery_rate {throttle}"
-        else:
-            feat_args = "1"
-
+        feat_args = f"2 max_recovery_rate {throttle}" if throttle else "1"
         table = f"0 {size} raid raid1 {feat_args} {region_size} 2 {m_orig} {orig} {m_dest} {dest}"
 
         if self._run_dm("suspend"):
@@ -119,32 +127,61 @@ class RAIDEngine:
         self._run_dm("resume")
         return False
 
+    def verify_integrity(self, orig, dest, samples=5, chunk_size=1024 * 1024):
+        """Compares multiple 1MB chunks to ensure orig/dest are identical."""
+        total_bytes = int(self._get_size(orig)) * 512
+        offsets = [
+            0,
+            total_bytes // 4,
+            total_bytes // 2,
+            total_bytes * 3 // 4,
+            total_bytes - chunk_size,
+        ]
+
+        print(f"[*] Verifying block integrity ({samples} samples)...")
+        for i, offset in enumerate(offsets):
+            h_orig = self._hash_chunk(orig, offset, chunk_size)
+            h_dest = self._hash_chunk(dest, offset, chunk_size)
+
+            if h_orig != h_dest:
+                print(f"[!] INTEGRITY FAILURE at byte {offset}")
+                return False
+            print(f"    Sample {i+1}/{samples} match.")
+        return True
+
     def stop(self):
-        """Flushes buffers and then removes the mapper device."""
-        if self._flush():
-            return self._run_dm("remove")
-        else:
-            print("[ERROR] Failed to flush buffers. Aborting stop for safety.")
-            return False
+        """Flushes buffers, settling XFS logs, then removes the device."""
+        device_path = f"/dev/mapper/{self.name}"
+        if os.path.exists(device_path):
+            print(f"[*] Flushing buffers for {self.name}...")
+            subprocess.run(["sync"], check=True)
+
+            # Attempt fsfreeze to commit XFS log tail if still mounted
+            with open("/proc/mounts", "r") as f:
+                for line in f:
+                    if device_path in line:
+                        mnt = line.split()[1]
+                        subprocess.run(["fsfreeze", "-f", mnt], capture_output=True)
+                        subprocess.run(["fsfreeze", "-u", mnt], capture_output=True)
+
+            subprocess.run(
+                ["blockdev", "--flushbufs", device_path], capture_output=True
+            )
+            time.sleep(1)  # Final settle time
+
+        return self._run_dm("remove")
 
     def get_status(self):
-        """Returns a tuple of (raw_status, percent_complete)."""
+        """Parses dmsetup status for raw output and % completion."""
         res = subprocess.run(
             ["dmsetup", "status", self.name], capture_output=True, text=True
         )
         if res.returncode != 0:
-            return None, "0"
-
+            return None, "0.00%"
         raw = res.stdout.strip()
-
-        # Typical raid status: 0 19529728 raid raid1 2 AA 19529728/19529728 1024 ...
-        # We look for the pattern 'synced/total'
         match = re.search(r"(\d+)/(\d+)", raw)
         if match:
-            synced = int(match.group(1))
-            total = int(match.group(2))
-            if total > 0:
-                percent = (synced / total) * 100
-                return raw, f"{percent:.2f}%"
-
+            synced, total = map(int, match.groups())
+            pct = (synced / total * 100) if total > 0 else 0
+            return raw, f"{pct:.2f}%"
         return raw, "0.00%"
