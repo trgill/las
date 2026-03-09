@@ -11,120 +11,123 @@
 las main.
 """
 #!/usr/bin/env python3
-import argparse, os, sys, subprocess, dm, database
+import argparse
+import sys
+import time
+
+# Project modules
+import utils
+import database
+from dm import RAIDEngine
 
 def main():
-    if os.geteuid() != 0:
-        print("Error: Root privileges required.")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description="LAS: Lift and Shift (Logical Adoption System) - Block Migration Tool"
+    )
+    subparsers = parser.add_subparsers(dest='command', help='Migration commands')
 
-    database.init_db()
-    parser = argparse.ArgumentParser(description="LAS: LUN Migration Utility")
-    subparsers = parser.add_subparsers(dest="command")
+    # --- Shared Arguments Helper ---
+    def add_common_args(p):
+        p.add_argument('--name', default='migration', help='Unique name for the migration')
+        p.add_argument('--orig', required=True, help='Source partition')
+        p.add_argument('--dest', required=True, help='Destination partition')
+        p.add_argument('--meta-orig', required=True, help='Source metadata partition')
+        p.add_argument('--meta-dest', required=True, help='Destination metadata partition')
 
-    # Command: wipe (Now handles its own logic)
-    wp = subparsers.add_parser("wipe", help="Deep wipe metadata partitions")
-    wp.add_argument("--devs", nargs="+", required=True, help="Partitions to wipe")
+    # --- 1. Command: activate ---
+    act = subparsers.add_parser('activate', help='Adopt LUNs into a live mirror')
+    add_common_args(act)
+    act.add_argument('--hook', help='Path to quiesce script')
 
-    # Command: activate
-    act = subparsers.add_parser("activate")
-    act.add_argument("--orig", required=True)
-    act.add_argument("--dest", required=True)
-    act.add_argument("--meta_orig", required=True)
-    act.add_argument("--meta_dest", required=True)
-    act.add_argument("--throttle", type=int)
-    act.add_argument("--name", default="las_migration")
+    # --- 2. Command: prepare-root ---
+    proot = subparsers.add_parser('prepare-root', help='Stage a root migration via Boom')
+    add_common_args(proot)
 
-    # Standard commands
-    subparsers.add_parser("sync").add_argument("--name", default="las_migration")
-    subparsers.add_parser("status").add_argument("--name", default="las_migration")
-    subparsers.add_parser("break").add_argument("--name", default="las_migration")
-    subparsers.add_parser("list")
+    # --- 3. Command: sync ---
+    syn = subparsers.add_parser('sync', help='Start or update sync throttle')
+    syn.add_argument('--name', default='migration')
+    syn.add_argument('--throttle', type=int, help='KiB/s speed limit')
 
+    # --- 4. Command: status ---
+    stat = subparsers.add_parser('status', help='Check sync progress')
+    stat.add_argument('--name', default='migration')
+    stat.add_argument('--wait', action='store_true', help='Monitor in real-time')
+
+    # --- 5. Command: list ---
+    subparsers.add_parser('list', help='List migrations in database')
+
+    # --- 6. Command: break ---
+    brk = subparsers.add_parser('break', help='Finalize and remove mirror')
+    brk.add_argument('--name', default='migration')
+
+    # Parse arguments after ALL subparsers are added
     args = parser.parse_args()
+
     if not args.command:
         parser.print_help()
         sys.exit(0)
 
+    # Initialize Engine
+    name = getattr(args, 'name', 'migration')
+    engine = RAIDEngine(name)
+
     # --- COMMAND LOGIC ---
 
-    if args.command == "wipe":
-        print(f"[*] WARNING: This will permanently erase signatures on {args.devs}")
-        if input("Proceed? (y/N): ").lower() == "y":
-            for d in args.devs:
-                print(f"[*] Wiping {d}...")
-                subprocess.run(["wipefs", "-a", d], check=True)
-                # Zeroing the start of the disk to clear RAID superblocks
-                subprocess.run(
-                    ["dd", "if=/dev/zero", f"of={d}", "bs=1M", "count=10"],
-                    capture_output=True,
-                )
-            print("[SUCCESS] Metadata partitions are clean.")
-        return  # Exit early after wipe
+    if args.command == 'list':
+        migrations = database.list_all_migrations()
+        if not migrations:
+            print("[*] No migrations found in database.")
+        else:
+            print(f"{'Name':<15} {'Source':<15} {'Dest':<18} {'Progress'}")
+            print("-" * 60)
+            for m in migrations:
+                temp_engine = RAIDEngine(m['name'])
+                _, pct = temp_engine.get_status()
+                print(f"{m['name']:<15} {m['orig']:<15} {m['dest']:<18} {pct}")
 
-    # Initialize engine ONLY for commands that use it
-    engine = dm.RAIDEngine(args.name)
+    elif args.command == 'status':
+        try:
+            while True:
+                raw, pct = engine.get_status()
+                print(f"[{name}] Progress: {pct} | Kernel info: {raw}")
+                if not args.wait or "100.00%" in pct:
+                    break
+                time.sleep(5)
+        except KeyboardInterrupt:
+            print("\n[*] Monitoring stopped.")
 
-    if args.command == "activate":
-        # 1. Baseline XFS check
-        if not engine.verify_xfs_magic(args.orig):
-            print(
-                f"[!] WARNING: Source {args.orig} does not have a valid XFS magic number."
-            )
-            if input("Continue anyway? (y/N): ").lower() != "y":
-                sys.exit(1)
+    elif args.command == 'prepare-root':
+        if utils.clone_header(args.orig, args.dest):
+            utils.update_xfs_uuid(args.dest)
+            if engine.setup_boom_entry(args.orig, args.dest, args.meta_orig, args.meta_dest):
+                database.record_migration(args.name, args.orig, args.dest, args.meta_orig, args.meta_dest, None)
+                print("\n[SUCCESS] Root migration prepared with Boom.")
 
-        # 2. Size validation check
-        if not engine.validate_sizes(args.orig, args.dest):
-            print("[!] CRITICAL: Migration aborted due to size mismatch.")
-            sys.exit(1)
+    elif args.command == 'activate':
+        if engine.activate_passive(args.orig, args.dest, args.meta_orig, args.meta_dest):
+            mnt = engine.remount_to_mapper(args.orig, args.hook)
+            database.record_migration(args.name, args.orig, args.dest, args.meta_orig, args.meta_dest, None)
+            print(f"[SUCCESS] Activated. Mounted at: {mnt if mnt else 'N/A'}")
 
-        # 3. Proceed to activation
-        if engine.activate_passive(
-            args.orig, args.dest, args.meta_orig, args.meta_dest
-        ):
-            database.record_migration(
-                args.name,
-                args.orig,
-                args.dest,
-                args.meta_orig,
-                args.meta_dest,
-                args.throttle,
-                active=False,
-            )
-            print(f"[SUCCESS] Migration {args.name} activated.")
-
-    elif args.command == "sync":
+    elif args.command == 'sync':
         rec = database.get_migration(args.name)
-        if rec and engine.start_sync(*rec):
-            database.record_migration(args.name, *rec, active=True)
-            print("[SUCCESS] Sync started.")
+        if rec and engine.start_sync(rec['orig'], rec['dest'], rec['meta_orig'], rec['meta_dest'], args.throttle):
+            database.update_throttle(args.name, args.throttle)
+            print(f"[SUCCESS] Sync speed set to {args.throttle or 'default'} KiB/s")
 
-    elif args.command == "status":
-        raw, pct = engine.get_status()
-        if raw:
-            print(f"Sync Progress: {pct}\nKernel Status: {raw}")
-
-    elif args.command == "break":
+    elif args.command == 'break':
         rec = database.get_migration(args.name)
         if not rec:
-            print("Error: Record not found.")
-            sys.exit(1)
+            print("[!] No record found."); sys.exit(1)
+        
+        _, pct = engine.get_status()
+        if "100.00%" not in pct:
+            if input(f"[!] Sync incomplete ({pct}). Finalize anyway? (y/N): ").lower() != 'y': sys.exit(0)
 
-        if not engine.verify_integrity(rec[0], rec[1]):
-            print("[!] INTEGRITY MISMATCH DETECTED.")
-            if input("Override and break mirror? (y/N): ").lower() != "y":
-                sys.exit(0)
-
+        engine.cleanup_boom_entry()
         if engine.stop():
             database.delete_migration(args.name)
-            print(f"[SUCCESS] Migration complete. Database cleared.")
-
-    elif args.command == "list":
-        with database.sqlite3.connect(database.DB_PATH) as conn:
-            rows = conn.execute("SELECT * FROM migrations").fetchall()
-            for r in rows:
-                print(r)
+            print("[SUCCESS] Finalized.")
 
 if __name__ == "__main__":
     main()

@@ -13,60 +13,65 @@ database interactions.
 import sqlite3
 import os
 
-DB_PATH = "/var/lib/las/migrations.db"
+# The database file will be created in the same directory as the script
+DB_PATH = "las_migration.db"
+
+def _get_conn():
+    """Helper to establish a connection with row access enabled."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 def init_db():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
+    """Creates the migration table if it doesn't already exist."""
+    with _get_conn() as conn:
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS migrations (
-                name TEXT PRIMARY KEY, 
-                origin TEXT NOT NULL, 
-                target TEXT NOT NULL,
-                meta_orig TEXT NOT NULL, 
+                name TEXT PRIMARY KEY,
+                orig TEXT NOT NULL,
+                dest TEXT NOT NULL,
+                meta_orig TEXT NOT NULL,
                 meta_dest TEXT NOT NULL,
-                throttle INTEGER, 
-                status TEXT DEFAULT 'nosync'
+                throttle INTEGER,
+                active INTEGER DEFAULT 0
             )
-        """
-        )
+        """)
+
+def record_migration(name, orig, dest, meta_orig, meta_dest, throttle):
+    """Saves or updates a migration record."""
+    init_db()
+    with _get_conn() as conn:
+        conn.execute("""
+            INSERT OR REPLACE INTO migrations 
+            (name, orig, dest, meta_orig, meta_dest, throttle, active)
+            VALUES (?, ?, ?, ?, ?, ?, 1)
+        """, (name, orig, dest, meta_orig, meta_dest, throttle))
         conn.commit()
-
-
-def record_migration(name, orig, dest, m_orig, m_dest, throttle, active=True):
-    status = "active" if active else "nosync"
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            REPLACE INTO migrations (name, origin, target, meta_orig, meta_dest, throttle, status) 
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-            (name, orig, dest, m_orig, m_dest, throttle, status),
-        )
-        conn.commit()
-
 
 def get_migration(name):
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT origin, target, meta_orig, meta_dest, throttle FROM migrations WHERE name=?",
-            (name,),
-        )
-        return cursor.fetchone()
+    """Retrieves a single migration record by name."""
+    init_db()
+    with _get_conn() as conn:
+        res = conn.execute("SELECT * FROM migrations WHERE name = ?", (name,)).fetchone()
+        return dict(res) if res else None
 
+def list_all_migrations():
+    """Returns a list of all migration records for the 'list' command."""
+    init_db()
+    with _get_conn() as conn:
+        rows = conn.execute("SELECT * FROM migrations").fetchall()
+        return [dict(row) for row in rows]
 
-def mark_complete(name):
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("UPDATE migrations SET status='completed' WHERE name=?", (name,))
+def update_throttle(name, throttle):
+    """Updates the sync throttle value for an existing migration."""
+    init_db()
+    with _get_conn() as conn:
+        conn.execute("UPDATE migrations SET throttle = ? WHERE name = ?", (throttle, name))
         conn.commit()
 
-
 def delete_migration(name):
-    """Removes the migration record entirely from the database."""
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("DELETE FROM migrations WHERE name=?", (name,))
+    """Removes a migration record upon completion ('break')."""
+    init_db()
+    with _get_conn() as conn:
+        conn.execute("DELETE FROM migrations WHERE name = ?", (name,))
         conn.commit()
