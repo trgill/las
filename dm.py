@@ -23,6 +23,73 @@ class RAIDEngine:
     def __init__(self, name):
         self.name = name
 
+    def list_blocking_pids(self, mount_point):
+        """Lists processes currently using the mount point."""
+        print(f"[!] Mount point {mount_point} is busy. Blocking processes:")
+        try:
+            # -m: Name of the mount point
+            # -v: Verbose (shows USER, PID, ACCESS, COMMAND)
+            res = subprocess.run(
+                ["fuser", "-m", "-v", mount_point], capture_output=True, text=True
+            )
+            print(res.stdout)
+        except Exception as e:
+            print(f"[!] Could not run fuser: {e}")
+
+    def remount_to_mapper(self, orig_dev, mapper_name):
+        """Attempts to swap mount from physical device to virtual mapper."""
+        mount_point = self.get_mount_point(orig_dev)
+        mapper_dev = f"/dev/mapper/{mapper_name}"
+
+        if not mount_point:
+            print(f"[*] {orig_dev} is not mounted. No swap needed.")
+            return None
+
+        print(f"[*] Origin {orig_dev} is mounted at {mount_point}. Attempting swap...")
+
+        # 1. First attempt at a clean unmount
+        res = subprocess.run(["umount", mount_point], capture_output=True, text=True)
+
+        if res.returncode != 0:
+            # 2. If it fails, list why
+            self.list_blocking_pids(mount_point)
+            print(
+                f"[!] ERROR: Cannot swap mount. Please close the above processes and try again."
+            )
+            return None
+
+        # 3. If unmount succeeded, mount the mapper
+        try:
+            subprocess.run(["mount", mapper_dev, mount_point], check=True)
+            print(f"[SUCCESS] {mapper_dev} is now live at {mount_point}")
+            return mount_point
+        except subprocess.CalledProcessError as e:
+            print(
+                f"[CRITICAL] Unmounted {orig_dev} but failed to mount {mapper_dev}: {e}"
+            )
+            return None
+
+    def clone_header(self, orig, dest, size_mb=1):
+        """Manually copies the first 1MB to sync disk labels and XFS superblocks."""
+        print(
+            f"[*] Manually cloning disk label and XFS header from {orig} to {dest}..."
+        )
+        try:
+            # conv=fsync ensures the write hits the platter before we continue
+            cmd = [
+                "dd",
+                f"if={orig}",
+                f"of={dest}",
+                f"bs={size_mb}M",
+                "count=1",
+                "conv=notrunc,fsync",
+            ]
+            res = subprocess.run(cmd, capture_output=True)
+            return res.returncode == 0
+        except Exception as e:
+            print(f"[!] Header clone failed: {e}")
+            return False
+
     def verify_xfs_magic(self, dev):
         """Checks if the first 4 bytes of a device match the XFS magic string."""
         try:
@@ -103,6 +170,29 @@ class RAIDEngine:
             logger.error(f"dmsetup {action} failed: {e}")
             return False
 
+    def update_xfs_uuid(self, dev):
+        """Generates a new, unique UUID for an XFS filesystem on the given device."""
+        if not self.verify_xfs_magic(dev):
+            return True  # Not XFS, skip
+
+        print(
+            f"[*] XFS detected on {dev}. Generating new UUID to prevent collisions..."
+        )
+        try:
+            # -U generate creates a new random UUID
+            res = subprocess.run(
+                ["xfs_admin", "-U", "generate", dev], capture_output=True, text=True
+            )
+            if res.returncode == 0:
+                print(f"[SUCCESS] New UUID generated for {dev}")
+                return True
+            else:
+                print(f"[!] xfs_admin failed: {res.stderr}")
+                return False
+        except Exception as e:
+            print(f"[!] Error updating UUID: {e}")
+            return False
+
     def activate_passive(self, orig, dest, m_orig, m_dest):
         """Creates a RAID1 target in 'nosync' mode for safe LUN adoption."""
         size = self._get_size(orig)
@@ -118,8 +208,10 @@ class RAIDEngine:
         """Reloads the table with max_recovery_rate to start sync."""
         size = self._get_size(orig)
         region_size = "1024"
-        feat_args = f"2 max_recovery_rate {throttle}" if throttle else "1"
-        table = f"0 {size} raid raid1 {feat_args} {region_size} 2 {m_orig} {orig} {m_dest} {dest}"
+        # TODO: add throttle support - not sure it is a good idea.
+        # feat_args = f"2 max_recovery_rate {throttle}" if throttle else "1"
+
+        table = f"0 {size} raid raid1 2 {region_size} sync 2 {m_orig} {orig} {m_dest} {dest}"
 
         if self._run_dm("suspend"):
             if self._run_dm("load", table):

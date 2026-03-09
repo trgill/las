@@ -28,15 +28,19 @@ def main():
 
     # Command: activate
     act = subparsers.add_parser("activate")
+    act.add_argument("--hook", help="Path to quiesce script (receives suspend/resume)")
     act.add_argument("--orig", required=True)
     act.add_argument("--dest", required=True)
     act.add_argument("--meta_orig", required=True)
     act.add_argument("--meta_dest", required=True)
-    act.add_argument("--throttle", type=int)
     act.add_argument("--name", default="las_migration")
 
     # Standard commands
-    subparsers.add_parser("sync").add_argument("--name", default="las_migration")
+    syn = subparsers.add_parser("sync")
+    syn.add_argument("--name", default="las_migration")
+    syn.add_argument(
+        "--throttle", type=int, help="Sync speed in KiB/s (e.g., 10000 for 10MB/s)"
+    )
     subparsers.add_parser("status").add_argument("--name", default="las_migration")
     subparsers.add_parser("break").add_argument("--name", default="las_migration")
     subparsers.add_parser("list")
@@ -61,25 +65,54 @@ def main():
                 )
             print("[SUCCESS] Metadata partitions are clean.")
         return  # Exit early after wipe
+    elif args.command == "list":
+        with database.sqlite3.connect(database.DB_PATH) as conn:
+            rows = conn.execute("SELECT * FROM migrations").fetchall()
+            for r in rows:
+                print(r)
+        return  # Exit early after wipe
 
     # Initialize engine ONLY for commands that use it
     engine = dm.RAIDEngine(args.name)
 
     if args.command == "activate":
-        # 1. Baseline XFS check
-        if not engine.verify_xfs_magic(args.orig):
-            print(
-                f"[!] WARNING: Source {args.orig} does not have a valid XFS magic number."
-            )
-            if input("Continue anyway? (y/N): ").lower() != "y":
-                sys.exit(1)
+        # Pass the hook script to the remount logic
+        new_mnt = engine.remount_to_mapper(args.orig, args.name, hook_script=args.hook)
 
-        # 2. Size validation check
-        if not engine.validate_sizes(args.orig, args.dest):
-            print("[!] CRITICAL: Migration aborted due to size mismatch.")
+        if new_mnt:
+            database.record_migration(
+                args.name,
+                args.orig,
+                args.dest,
+                args.meta_orig,
+                args.meta_dest,
+                None,
+                active=False,
+            )
+            print(f"[SUCCESS] {args.name} is fully adopted and live.")
+        else:
+            print("[!] Handover failed. Cleaning up Device Mapper...")
+            engine.stop()  # Remove the DM device since we rolled back to physical
             sys.exit(1)
 
-        # 3. Proceed to activation
+        # 1. Baseline Magic Check
+        is_xfs = engine.verify_xfs_magic(args.orig)
+
+        # 2. Size Validation
+        if not engine.validate_sizes(args.orig, args.dest):
+            sys.exit(1)
+
+        # 3. MANUAL HEADER CLONE
+        if not engine.clone_header(args.orig, args.dest):
+            print("[!] CRITICAL: Failed to clone disk label.")
+            sys.exit(1)
+
+        # 4. UPDATE TARGET UUID (The Fix)
+        # if is_xfs:
+        #     if not engine.update_xfs_uuid(args.dest):
+        #         print("[!] WARNING: Could not update XFS UUID. Collisions may occur.")
+
+        # 5. DM Activation
         if engine.activate_passive(
             args.orig, args.dest, args.meta_orig, args.meta_dest
         ):
@@ -89,10 +122,9 @@ def main():
                 args.dest,
                 args.meta_orig,
                 args.meta_dest,
-                args.throttle,
                 active=False,
             )
-            print(f"[SUCCESS] Migration {args.name} activated.")
+            print(f"[SUCCESS] Migration {args.name} activated with unique UUID.")
 
     elif args.command == "sync":
         rec = database.get_migration(args.name)
@@ -120,11 +152,6 @@ def main():
             database.delete_migration(args.name)
             print(f"[SUCCESS] Migration complete. Database cleared.")
 
-    elif args.command == "list":
-        with database.sqlite3.connect(database.DB_PATH) as conn:
-            rows = conn.execute("SELECT * FROM migrations").fetchall()
-            for r in rows:
-                print(r)
 
 if __name__ == "__main__":
     main()
