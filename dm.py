@@ -20,94 +20,72 @@ class RAIDEngine:
     
     def init_raid_metadata(self, orig, dest, meta_orig, meta_dest):
         """
-        Initializes RAID1 metadata for both legs using a 1024 region size.
-        Uses a loopback alias on 'dest' (/dev/sdd) to proxy for the busy 'orig' (/dev/sda).
+        Initializes RAID1 metadata using the 'Missing Leg' strategy.
+        Initializes the destination as Leg 1 of a degraded array, then
+        clones that valid metadata to the origin meta disk.
         """
         import subprocess
         import time
 
-        # 1. Calculate Sectors (Aligned to 1024 / 512KiB)
-        # This ensures the RAID table ends exactly on a region boundary.
+        # 1. Calculate Sectors (Aligned to 1024)
         res = subprocess.run(['blockdev', '--getsz', orig], capture_output=True, text=True)
-        raw_sectors = int(res.stdout.strip())
-        self.sectors = (raw_sectors // 1024) * 1024
+        self.sectors = (int(res.stdout.strip()) // 1024) * 1024
 
-        print(f"[*] Target Geometry: {self.sectors} sectors (Region Size: 1024)")
+        print(f"[*] Targeting {self.sectors} sectors (1024 sector alignment)")
 
-        # 2. Wipe existing signatures to ensure a clean 'dmsetup'
-        # This prevents 'Device or resource busy' if old partitions exist on sdd.
-        print(f"[*] Wiping signatures on {dest}, {meta_orig}, {meta_dest}...")
+        # 2. Wipe existing signatures on destination and metadata disks
         for dev in [dest, meta_orig, meta_dest]:
-            subprocess.run(['sudo', 'wipefs', '-a', dev], check=True, capture_output=True)
+            subprocess.run(['sudo', 'wipefs', '-a', dev], check=True)
         
-        # 3. Create Loopback Alias for Destination (/dev/sdd)
-        # This lets us 'open' the same physical disk twice (once as sdd, once as loopX).
-        loop_res = subprocess.run(['sudo', 'losetup', '--find', '--show', dest], 
-                                  capture_output=True, text=True)
-        loop_dev = loop_res.stdout.strip()
-        
-        if not loop_dev.startswith('/dev/loop'):
-            print("[!] Error: Could not allocate a loopback device.")
-            return False
+        # 3. Create 'Degraded' RAID (Leg 0 is missing)
+        # Table format: 0 <len> raid raid1 <#opts> <region> <nosync> <#legs> <m0> <d0> <m1> <d1>
+        # We use '-' for Leg 0's meta and data.
+        prime_name = f"las_prime_{self.name}"
+        prime_table = (
+            f"0 {self.sectors} raid raid1 2 1024 nosync 2 "
+            f"- - {meta_dest} {dest}"
+        )
 
         try:
-            print(f"[*] Using {loop_dev} as Proxy-Leg-0 for the busy origin...")
+            print("[*] Priming Leg 1 metadata (Leg 0 marked as missing)...")
+            subprocess.run(['sudo', 'dmsetup', 'create', prime_name, '--table', prime_table], check=True)
             
-            # 4. The 'Prime' Table
-            # 2: Optional parameter count (region_size + nosync)
-            # 1024: The granular region size
-            # nosync: Skip initial mirror sync
-            # 2: Total RAID legs
-            table = (
-                f"0 {self.sectors} raid raid1 2 1024 nosync 2 "
-                f"{meta_orig} {loop_dev} {meta_dest} {dest}"
-            )
+            # Allow kernel to settle the bits
+            time.sleep(2)
+            
+            # Remove the device to flush and close
+            subprocess.run(['sudo', 'dmsetup', 'remove', prime_name], check=True)
 
-            # 5. Create the temporary RAID device to write the clean superblocks
-            temp_name = f"las_prime_{self.name}"
-            subprocess.run(['sudo', 'dmsetup', 'create', temp_name, '--table', table], 
-                           check=True, capture_output=True, text=True)
-            
-            # Allow the kernel a moment to commit the headers to sdc and sdb
-            time.sleep(1)
-            
-            # 6. Remove the temporary device to flush buffers and close the disks
-            subprocess.run(['sudo', 'dmsetup', 'remove', temp_name], check=True)
-            print("[SUCCESS] Leg 0 (Origin) and Leg 1 (Dest) metadata successfully initialized.")
+            # 4. Clone metadata from Leg 1 to Leg 0
+            # Since Leg 1 is now a valid RAID leg, its superblock is perfect.
+            # Copying it to meta_orig gives Leg 0 a starting point.
+            print(f"[*] Cloning valid metadata: {meta_dest} -> {meta_orig}")
+            subprocess.run([
+                'sudo', 'dd', 
+                f'if={meta_dest}', 
+                f'of={meta_orig}', 
+                'bs=1M', 'count=10', 'status=none'
+            ], check=True)
+
+            print("[SUCCESS] Metadata initialized via Missing Leg Strategy.")
             return True
 
         except subprocess.CalledProcessError as e:
-            print(f"[!] Metadata initialization failed: {e.stderr}")
+            print(f"[!] Metadata priming failed: {e}")
             return False
-        finally:
-            # 7. Cleanup: Always detach the loopback to free the disk
-            print(f"[*] Detaching loopback proxy {loop_dev}...")
-            subprocess.run(['sudo', 'losetup', '-d', loop_dev])
         
     def get_dm_mod_string(self, orig, dest, meta_orig, meta_dest):
-        """
-        Generates the dm-mod.create string using persistent IDs and correct 
-        RAID1 pairings: 2 <Meta_A> <Data_A> <Meta_B> <Data_B>
-        """
-        # Resolve volatile names (/dev/sda) to persistent IDs
+        # Resolve to persistent IDs
         p_orig = utils.get_persistent_path(orig)
         p_dest = utils.get_persistent_path(dest)
         p_m_orig = utils.get_persistent_path(meta_orig)
         p_m_dest = utils.get_persistent_path(meta_dest)
 
-        # The Magic Formula: 
-        # 1. Start with 0 <sectors>
-        # 2. Target type 'raid', sub-type 'raid1'
-        # 3. '1 nosync' (parameter count + parameter)
-        # 4. '8192' (region size)
-        # 5. '2' (number of raid copies)
-        # 6. Pairs of (Metadata, Data)
-        table = (
-            f"0 {self.sectors} raid raid1 2 nosync 8192 2 "
-            f"{p_m_orig} {p_orig} {p_m_dest} {p_dest}"
-        )
+        # The kernel 'raid' target expects:
+        # raid <subtype> <#opt_params> <opt_params...> <#legs> [<meta_dev> <data_dev>...]
+        # Parameters: 2 (count), nosync, region_size 1024
+        table = f"0 {self.sectors} raid raid1 1 nosync 2 {p_m_orig} {p_orig} {p_m_dest} {p_dest}"
         
-        # Format: <name>,<uuid>,<major>,<flags>,<table>
         return f"{self.name},,0,rw,{table}"
 
     def setup_boom_entry(self, orig, dest, m_orig, m_dest):
@@ -117,13 +95,22 @@ class RAIDEngine:
         # FIX 1: Load the raid module BEFORE dm-init runs
         # FIX 2: Swap console order so ttyS0 is the interactive one (last)
         # FIX 3: Force emergency shell to not ask for password
-        debug_opts = (
-            "rd.driver.pre=dm-raid "
-            "SYSTEMD_SULOGIN_FORCE=1 "
-            "console=tty0 "
-            "console=ttyS0,115200n8 "
-            "rd.debug loglevel=7"
-        )
+        # Define arguments as a clean list
+        args = [
+            "rd.driver.pre=dm-raid",
+            "rd.timeout=30",
+            "rd.shell",
+            f"root=/dev/mapper/{self.name}",
+            "SYSTEMD_SULOGIN_FORCE=1",
+            "console=tty0",
+            "console=ttyS0,115200n8",
+            "rd.debug",
+            "loglevel=7",
+            f'dm-mod.create={dm_string}'
+        ]
+        
+        # Join them with a single space safely
+        opts = " ".join(args)
         
         try:
             # Ensure the LAS profile exists for Boom
@@ -135,7 +122,7 @@ class RAIDEngine:
                 '--root-device', f'/dev/mapper/{self.name}',
                 '--version', kver,
                 '--no-dev',
-                '--add-opts', f'{debug_opts} dm-mod.create="{dm_string}"'
+                '--add-opts', f'{opts}'
             ]
             
             res = subprocess.run(cmd, capture_output=True, text=True)

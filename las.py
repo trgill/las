@@ -110,31 +110,11 @@ def main():
         print(f"[*] Preparing Pivot-Root migration: {args.name}")
         print(f"[*] Source: {args.orig} | Destination: {args.dest}")
         # Inside the prepare-root block...
-        supported, msg = utils.verify_initramfs_dm_support()
         
-        if not supported:
-            print(f"\n[!] {msg}")
-            
-            # Determine if we should fix automatically or ask
-            do_fix = False
-            if args.fix_boot:
-                print("[*] --fix-boot detected. Proceeding with automatic repair...")
-                do_fix = True
-            else:
-                choice = input("\n[?] Attempt to rebuild Initramfs now? (y/N): ")
-                if choice.lower() == 'y':
-                    do_fix = True
-
-            if do_fix:
-                if utils.rebuild_initramfs():
-                    # Re-verify after the fix
-                    final_check, _ = utils.verify_initramfs_dm_support()
-                    if final_check:
-                        print("[SUCCESS] Initramfs is now RAID-capable.")
-                    else:
-                        print("[!] Rebuild completed but verification still fails. Check dracut logs.")
-                else:
-                    print("[!] Auto-fix failed. Manual intervention required.")
+        print("[*] Verifying and hardening Initramfs...")
+        if not utils.verify_and_fix_initramfs():
+            print("[!] FATAL: Initramfs is not RAID-capable. Reboot will hang.")
+            return False
             
         # 1. Primes the metadata devices with RAID1 superblocks
         print(f"[*] Initializing RAID headers on {args.meta_orig} and {args.meta_dest}...")

@@ -106,19 +106,19 @@ def verify_initramfs_dm_support():
 
 def rebuild_initramfs():
     """Forces a rebuild of the Initramfs with required RAID drivers."""
-    kver = os.uname().release
-    img = f"/boot/initramfs-{kver}.img"
+    kver = subprocess.run(['uname', '-r'], capture_output=True, text=True).stdout.strip()
+    initrd_path = f"/boot/initramfs-{kver}.img"
     
     print(f"[*] Rebuilding {img} with dm-raid support...")
     
     # We use --add-drivers to bypass the missing 'raid' dracut module
     # and --no-hostonly to ensure it works even if RAID isn't active now.
     cmd = [
-        'sudo', 'dracut', 
+        'sudo', 'dracut', '--force', 
+        '--add', 'dm', 
         '--add-drivers', 'dm-raid raid1', 
-        '--force', 
-        '--no-hostonly', 
-        img
+        '--install', 'dmsetup',
+        initrd_path, kver
     ]
     
     try:
@@ -153,3 +153,94 @@ def get_persistent_path(dev_path):
             return full_link
             
     return dev_path
+
+def verify_and_fix_initramfs(name="migration"):
+    """
+    Audits the current Initramfs for DM and RAID support.
+    If missing, it force-rebuilds the image to include dmsetup and dm-raid drivers.
+    """
+    try:
+        # 1. Identify the current kernel version
+        kver = subprocess.run(['uname', '-r'], capture_output=True, text=True, check=True).stdout.strip()
+        initrd_path = f"/boot/initramfs-{kver}.img"
+        
+        print(f"[*] Auditing {initrd_path} for LAS compatibility...")
+
+        # 2. Use lsinitrd to check for the 'engine' and the 'driver'
+        # We look for 'dmsetup' (the tool) and 'dm-raid.ko' (the kernel module)
+        audit_res = subprocess.run(['lsinitrd', initrd_path], capture_output=True, text=True, check=True)
+        audit_output = audit_res.stdout
+
+        has_dmsetup = "bin/dmsetup" in audit_output
+        has_raid_mod = "dm-raid.ko" in audit_output
+
+        if has_dmsetup and has_raid_mod:
+            print("[+] Initramfs audit passed: DM and RAID support detected.")
+            return True
+
+        # 3. If either is missing, we trigger the "Heavyweight" rebuild
+        if not has_dmsetup:
+            print("[!] Missing 'dmsetup' binary in Initramfs.")
+        if not has_raid_mod:
+            print("[!] Missing 'dm-raid' kernel module in Initramfs.")
+            
+        print(f"[*] Rebuilding Initramfs with --add 'dm dmraid' and --install 'dmsetup'...")
+        
+        # We explicitly add 'dm' (for tools/infrastructure) and 'dmraid' (for drivers)
+        # --install ensures the dmsetup binary is physically copied in.
+        dracut_cmd = [
+            'sudo', 'dracut', '--force',
+            '--add', 'dm dmraid',
+            '--install', 'dmsetup',
+            initrd_path, kver
+        ]
+        
+        subprocess.run(dracut_cmd, check=True)
+        print(f"[SUCCESS] {initrd_path} is now hardened for LAS migration.")
+        return True
+
+    except FileNotFoundError:
+        print("[ERROR] 'lsinitrd' or 'dracut' not found. Is this a Fedora/RHEL system?")
+        return False
+    except subprocess.CalledProcessError as e:
+        print(f"[ERROR] Failed to harden Initramfs: {e}")
+        return False
+
+def inject_las_assembly_hook(dm_table_string):
+    """
+    Creates a pre-mount hook for dracut to assemble the RAID manually.
+    Bypasses the fragile dm-mod.create kernel parameter.
+    """
+    hook_content = f"""#!/bin/sh
+# LAS Auto-Assembly Hook
+if [ ! -e /dev/mapper/migration ]; then
+    echo "LAS: Manually assembling RAID device..."
+    echo "{dm_table_string}" | dmsetup create migration
+fi
+"""
+    hook_path = "/tmp/99-las-assemble.sh"
+    
+    try:
+        # 1. Write the hook script locally
+        with open(hook_path, "w") as f:
+            f.write(hook_content)
+        os.chmod(hook_path, 0o755)
+
+        # 2. Rebuild Initramfs and include this file in the pre-mount hook directory
+        kver = subprocess.check_output(['uname', '-r'], text=True).strip()
+        initrd_path = f"/boot/initramfs-{kver}.img"
+        
+        print(f"[*] Injecting assembly hook into {initrd_path}...")
+        subprocess.run([
+            'sudo', 'dracut', '--force',
+            '--add', 'dm',
+            '--install', 'dmsetup',
+            '--include', hook_path, '/usr/lib/dracut/hooks/pre-mount/99-las-assemble.sh',
+            initrd_path, kver
+        ], check=True)
+        
+        print("[SUCCESS] Dracut hook injected.")
+        return True
+    except Exception as e:
+        print(f"[!] Failed to inject hook: {e}")
+        return False
