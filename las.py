@@ -2,15 +2,14 @@
 #
 # Copyright Red Hat
 #
-# snapm/_snapm.py - Snapshot Manager global definitions
-#
-# This file is part of the snapm project.
+# This file is part of the las project.
 #
 # SPDX-License-Identifier: Apache-2.0
 """
 las main.
 """
 #!/usr/bin/env python3
+import os
 import argparse
 import sys
 import time
@@ -19,6 +18,75 @@ import time
 import utils
 import database
 from dm import RAIDEngine
+
+
+def prepare_root(engine, name, origin, dest, meta_orig, meta_dest, throttle=None):
+    """
+    Main workflow to prepare the system for migration.
+    """
+    import os
+    import utils
+    import database
+
+    # 1. Initialize RAID Metadata (The "Missing Leg" Strategy)
+    # This prepares the disks and calculates the usable sector count
+    if not engine.init_raid_metadata(origin, dest, meta_orig, meta_dest):
+        print("[!] RAID metadata initialization failed.")
+        return False
+
+    # 2. Resolve ALL persistent paths (by-id)
+    # These are used for the RAID table and the 'wait' loop in the hook
+    p_orig = utils.get_persistent_path(origin)
+    p_dest = utils.get_persistent_path(dest)
+    p_m_orig = utils.get_persistent_path(meta_orig)
+    p_m_dest = utils.get_persistent_path(meta_dest)
+
+    # 3. Construct the DM-RAID Table String
+    # 2 = optional parameter count (1024 and nosync)
+    raw_table = (
+        f"0 {engine.sectors} raid raid1 2 1024 nosync 2 "
+        f"{p_m_orig} {p_orig} {p_m_dest} {p_dest}"
+    )
+
+    # 4. Inject Hook and Create the ISOLATED Initramfs
+    # We pass the required disks so the hook knows exactly what to wait for
+    print(f"[*] Creating isolated migration Initramfs for '{name}'...")
+    required_disks = [p_m_orig, p_orig, p_m_dest, p_dest]
+    
+    custom_img = utils.inject_las_assembly_hook(name, raw_table, required_disks)
+    if not custom_img:
+        print("[!] Failed to create specialized Initramfs.")
+        return False
+
+    # 5. Detect Filesystem Info from the ACTIVE partition
+    # This finds if we are on Btrfs/XFS and gets the subvolume flags
+    root_partition = utils.get_root_device()
+    if not root_partition:
+        print("[!] Could not determine active root partition.")
+        return False
+
+    print(f"[*] Detecting filesystem on {root_partition}...")
+    fstype, fsflags = utils.get_root_filesystem_info(root_partition)
+    print(f"[*] FS Info: type='{fstype}', flags='{fsflags}'")
+
+    # 6. CALL SETUP_BOOM_ENTRY
+    # This is the call you were looking for. It passes the custom image 
+    # and the detected filesystem metadata to the Boom CLI logic.
+    if not engine.setup_boom_entry(custom_img, fstype, fsflags):
+        print("[!] Failed to create Boom boot entry.")
+        # Cleanup the orphaned image if Boom failed to write the config
+        if os.path.exists(custom_img):
+            os.remove(custom_img)
+        return False
+
+    # 7. Record the Migration to the Database
+    # This allows 'las list' and 'las break' to function later
+    database.record_migration(name, origin, dest, meta_orig, meta_dest, throttle)
+
+    print(f"\n[SUCCESS] Preparation complete for '{name}'.")
+    print(f"[INFO] Filesystem: {fstype} ({fsflags})")
+    print("[ACTION] Reboot and select the 'LAS-migration' entry from the GRUB menu.")
+    return True
 
 def main():
     parser = argparse.ArgumentParser(
@@ -107,69 +175,7 @@ def main():
     # --- LOGIC: prepare-root ---
     # This command prepares a system for a "Pivot-on-Reboot" migration.
     elif args.command == 'prepare-root':
-        print(f"[*] Preparing Pivot-Root migration: {args.name}")
-        print(f"[*] Source: {args.orig} | Destination: {args.dest}")
-        # Inside the prepare-root block...
-        
-        print("[*] Verifying and hardening Initramfs...")
-        if not utils.verify_and_fix_initramfs():
-            print("[!] FATAL: Initramfs is not RAID-capable. Reboot will hang.")
-            return False
-            
-        # 1. Primes the metadata devices with RAID1 superblocks
-        print(f"[*] Initializing RAID headers on {args.meta_orig} and {args.meta_dest}...")
-        if not engine.init_raid_metadata(args.orig, args.dest, args.meta_orig, args.meta_dest):
-            print("[!] CRITICAL: Failed to clone RAID headers. Metadata is uninitialized.")
-            print("[!] The kernel will not be able to assemble the RAID at boot. Aborting.")
-            sys.exit(1)
-
-        # 2. BOOTLOADER PREP: Create the Boom BLS entry.
-        # This adds the 'LAS-migration' option to your GRUB menu.
-        # It includes 'rd.driver.pre' to ensure modules load before table parsing.
-        if engine.setup_boom_entry(args.orig, args.dest, args.meta_orig, args.meta_dest):
-            # Record the intent in our central database in /etc/
-            database.record_migration(
-                args.name, args.orig, args.dest, 
-                args.meta_orig, args.meta_dest, args.throttle
-            )
-            
-            print("\n[+] Boom entry created successfully.")
-            
-            # 3. DRIVER PREP: Verify the Initramfs actually contains the RAID drivers.
-            # Fedora 43 often strips these out if the host isn't currently using RAID.
-            supported, msg = utils.verify_initramfs_dm_support()
-            
-            if not supported:
-                print(f"\n[!] BOOT CAPABILITY WARNING:")
-                print(f"    {msg}")
-                
-                # Interactive Auto-Fix
-                confirm = input("\n[?] Would you like to rebuild Initramfs with RAID drivers now? (y/N): ")
-                if confirm.lower() == 'y':
-                    if utils.rebuild_initramfs():
-                        # Final verification post-rebuild
-                        reverify, _ = utils.verify_initramfs_dm_support()
-                        if reverify:
-                            print("[SUCCESS] Initramfs is now RAID-capable.")
-                        else:
-                            print("[!] Rebuild completed but drivers still not detected. Check logs.")
-                    else:
-                        print("[!] Failed to rebuild Initramfs. Manual intervention required.")
-                else:
-                    print("[!] WARNING: System may hang on reboot if drivers are missing.")
-            else:
-                print(f"[*] {msg}")
-
-            print("\n" + "="*60)
-            print(" PREPARATION COMPLETE ")
-            print("="*60)
-            print(" 1. Reboot.")
-            print(f" 2. Select 'LAS-{args.name}' from the GRUB menu.")
-            print("="*60)
-
-        else:
-            print("[!] Error: Could not create Boom boot entry.")
-            sys.exit(1)
+        prepare_root(engine, name, args.orig, args.dest, args.meta_orig, args.meta_dest)
 
     elif args.command == 'activate':
         if engine.activate_passive(args.orig, args.dest, args.meta_orig, args.meta_dest):
@@ -193,9 +199,9 @@ def main():
             if input(f"[!] Sync incomplete ({pct}). Finalize anyway? (y/N): ").lower() != 'y': sys.exit(0)
 
         engine.cleanup_boom_entry()
-        if engine.stop():
-            database.delete_migration(args.name)
-            print("[SUCCESS] Finalized.")
+        engine.stop()
+        database.delete_migration(args.name)
+        print("[SUCCESS] Finalized.")
 
 if __name__ == "__main__":
     main()

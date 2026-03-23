@@ -1,6 +1,12 @@
+#!/usr/bin/env python3
+#
+# Copyright Red Hat
+#
+# This file is part of the las project.
+#
+# SPDX-License-Identifier: Apache-2.0
 import subprocess
 import os
-import hashlib
 import sys
 
 def get_block_size(dev):
@@ -15,33 +21,12 @@ def get_block_size(dev):
         sys.exit(1)
     return int(res.stdout.strip())
 
-def verify_xfs_magic(dev):
-    """Checks for XFSB signature."""
-    try:
-        with open(dev, 'rb') as f:
-            return f.read(4) == b'XFSB'
-    except Exception:
-        return False
-
-def clone_header(orig, dest, size_mb=1):
-    """Bit-copy the start of the disk for labels/superblocks."""
-    print(f"[*] Cloning first {size_mb}MB from {orig} to {dest}...")
-    cmd = ['dd', f'if={orig}', f'of={dest}', f'bs={size_mb}M', 'count=1', 'conv=notrunc,fsync']
-    return subprocess.run(cmd, capture_output=True).returncode == 0
-
-def update_xfs_uuid(dev):
-    """Generates a new UUID to prevent kernel collisions."""
-    if not verify_xfs_magic(dev):
-        return True
-    print(f"[*] Generating new XFS UUID for {dev}...")
-    return subprocess.run(['xfs_admin', '-U', 'generate', dev], capture_output=True).returncode == 0
-
 def get_mount_point(dev):
     """Finds where a device is mounted."""
     with open('/proc/mounts', 'r') as f:
         for line in f:
             parts = line.split()
-            if parts[0] == dev:
+            if parts and parts[0] == dev:
                 return parts[1]
     return None
 
@@ -62,185 +47,158 @@ def run_hook(script_path, action):
     res = subprocess.run([script_path, action], capture_output=True, text=True)
     return res.returncode == 0
 
-def check_initramfs_capabilities():
-    """Checks if the current boot image can handle DM-RAID."""
-    kver = subprocess.run(['uname', '-r'], capture_output=True, text=True).stdout.strip()
-    img = f"/boot/initramfs-{kver}.img"
-    
-    res = subprocess.run(['lsinitrd', img], capture_output=True, text=True)
-    if "dm-raid" not in res.stdout:
-        print(f"[!] CRITICAL: {img} is missing 'dm-raid' modules.")
-        print("[*] Fix with: sudo dracut --add 'raid dm' --force")
-        return False
-    return True
-
-def verify_initramfs_dm_support():
-    """
-    Checks if the current Initramfs has the drivers required 
-    to process dm-mod.create at boot time.
-    """
-    kver = subprocess.run(['uname', '-r'], capture_output=True, text=True).stdout.strip()
-    img = f"/boot/initramfs-{kver}.img"
-    
-    if not os.path.exists(img):
-        return False, f"Initramfs not found at {img}"
-
-    # lsinitrd lists all files in the initramfs
-    res = subprocess.run(['lsinitrd', img], capture_output=True, text=True)
-    contents = res.stdout
-    
-    # Check for the actual kernel modules
-    has_dm_raid = "dm-raid.ko" in contents
-    has_raid1 = "raid1.ko" in contents
-    
-    # Check for the dracut module that handles RAID assembly
-    has_dracut_module = "modules.d/90dmraid" in contents or "modules.d/90mdraid" in contents
-
-    if not (has_dm_raid and has_raid1):
-        return False, (
-            f"MISSING DRIVERS: {img} does not contain dm-raid or raid1.\n"
-            f"Fix: sudo dracut --add-drivers 'dm-raid raid1' --force --no-hostonly"
-        )
-    
-    return True, "Initramfs verified for DM-RAID support."
-
-def rebuild_initramfs():
-    """Forces a rebuild of the Initramfs with required RAID drivers."""
-    kver = subprocess.run(['uname', '-r'], capture_output=True, text=True).stdout.strip()
-    initrd_path = f"/boot/initramfs-{kver}.img"
-    
-    print(f"[*] Rebuilding {img} with dm-raid support...")
-    
-    # We use --add-drivers to bypass the missing 'raid' dracut module
-    # and --no-hostonly to ensure it works even if RAID isn't active now.
-    cmd = [
-        'sudo', 'dracut', '--force', 
-        '--add', 'dm', 
-        '--add-drivers', 'dm-raid raid1', 
-        '--install', 'dmsetup',
-        initrd_path, kver
-    ]
-    
-    try:
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        if res.returncode == 0:
-            print("[SUCCESS] Initramfs updated with dm-raid and raid1 drivers.")
-            return True
-        else:
-            print(f"[!] Dracut Error: {res.stderr}")
-            return False
-    except Exception as e:
-        print(f"[!] Failed to execute dracut: {e}")
-        return False
-    
 def get_persistent_path(dev_path):
     """
-    Translates a volatile /dev/sdX path into a persistent /dev/disk/by-id path.
+    Returns the /dev/disk/by-id/ path for a disk or a partition.
+    Correctly handles suffixes like -part3 for RAID members.
     """
-    if not dev_path.startswith('/dev/sd'):
-        return dev_path # Already persistent or not a standard disk
-        
-    dev_name = os.path.basename(dev_path)
-    base_id_path = '/dev/disk/by-id'
-    
-    if not os.path.exists(base_id_path):
+    import os
+    if not dev_path.startswith('/dev/'):
         return dev_path
-
-    for link in os.listdir(base_id_path):
-        full_link = os.path.join(base_id_path, link)
-        if os.path.realpath(full_link) == os.path.realpath(dev_path):
-            # We prefer 'virtio-' or 'ata-' IDs over 'dm-uuid'
-            return full_link
-            
+    
+    dev_name = os.path.basename(dev_path)
+    by_id_dir = '/dev/disk/by-id'
+    
+    if os.path.exists(by_id_dir):
+        for link in os.listdir(by_id_dir):
+            full_link = os.path.join(by_id_dir, link)
+            if os.path.realpath(full_link).endswith(dev_name):
+                # Prefer scsi- or nvme- IDs over wwn- or ata-
+                if link.startswith(('scsi-', 'nvme-')):
+                    return full_link
     return dev_path
 
-def verify_and_fix_initramfs(name="migration"):
+def inject_las_assembly_hook(name, dm_table_string, wait_disks):
     """
-    Audits the current Initramfs for DM and RAID support.
-    If missing, it force-rebuilds the image to include dmsetup and dm-raid drivers.
+    Creates a specialized, isolated Initramfs for LAS migration.
+    Dynamically waits for specific disks to prevent -ENOENT errors.
     """
-    try:
-        # 1. Identify the current kernel version
-        kver = subprocess.run(['uname', '-r'], capture_output=True, text=True, check=True).stdout.strip()
-        initrd_path = f"/boot/initramfs-{kver}.img"
-        
-        print(f"[*] Auditing {initrd_path} for LAS compatibility...")
+    # Create the shell-script snippet that waits for each required disk
+    wait_logic = ""
+    for disk in wait_disks:
+        wait_logic += f"""
+    echo "LAS: Waiting for {disk}..."
+    i=0
+    while [ $i -lt 15 ]; do
+        [ -e "{disk}" ] && break
+        sleep 1
+        i=$((i+1))
+    done
+"""
 
-        # 2. Use lsinitrd to check for the 'engine' and the 'driver'
-        # We look for 'dmsetup' (the tool) and 'dm-raid.ko' (the kernel module)
-        audit_res = subprocess.run(['lsinitrd', initrd_path], capture_output=True, text=True, check=True)
-        audit_output = audit_res.stdout
-
-        has_dmsetup = "bin/dmsetup" in audit_output
-        has_raid_mod = "dm-raid.ko" in audit_output
-
-        if has_dmsetup and has_raid_mod:
-            print("[+] Initramfs audit passed: DM and RAID support detected.")
-            return True
-
-        # 3. If either is missing, we trigger the "Heavyweight" rebuild
-        if not has_dmsetup:
-            print("[!] Missing 'dmsetup' binary in Initramfs.")
-        if not has_raid_mod:
-            print("[!] Missing 'dm-raid' kernel module in Initramfs.")
-            
-        print(f"[*] Rebuilding Initramfs with --add 'dm dmraid' and --install 'dmsetup'...")
-        
-        # We explicitly add 'dm' (for tools/infrastructure) and 'dmraid' (for drivers)
-        # --install ensures the dmsetup binary is physically copied in.
-        dracut_cmd = [
-            'sudo', 'dracut', '--force',
-            '--add', 'dm dmraid',
-            '--install', 'dmsetup',
-            initrd_path, kver
-        ]
-        
-        subprocess.run(dracut_cmd, check=True)
-        print(f"[SUCCESS] {initrd_path} is now hardened for LAS migration.")
-        return True
-
-    except FileNotFoundError:
-        print("[ERROR] 'lsinitrd' or 'dracut' not found. Is this a Fedora/RHEL system?")
-        return False
-    except subprocess.CalledProcessError as e:
-        print(f"[ERROR] Failed to harden Initramfs: {e}")
-        return False
-
-def inject_las_assembly_hook(dm_table_string):
-    """
-    Creates a pre-mount hook for dracut to assemble the RAID manually.
-    Bypasses the fragile dm-mod.create kernel parameter.
-    """
+    # The actual hook script content
     hook_content = f"""#!/bin/sh
-# LAS Auto-Assembly Hook
-if [ ! -e /dev/mapper/migration ]; then
-    echo "LAS: Manually assembling RAID device..."
-    echo "{dm_table_string}" | dmsetup create migration
+# LAS Auto-Assembly Hook for {name}
+echo "LAS: Settling storage hardware..."
+udevadm settle --timeout=10
+
+{wait_logic}
+
+if [ ! -e /dev/mapper/{name} ]; then
+    echo "LAS: Assembling RAID device '{name}'..."
+    echo "{dm_table_string}" | dmsetup create {name}
 fi
 """
-    hook_path = "/tmp/99-las-assemble.sh"
+    
+    hook_path = f"/tmp/99-las-assemble-{name}.sh"
     
     try:
-        # 1. Write the hook script locally
+        # 1. Write the temporary hook script
         with open(hook_path, "w") as f:
             f.write(hook_content)
         os.chmod(hook_path, 0o755)
 
-        # 2. Rebuild Initramfs and include this file in the pre-mount hook directory
+        # 2. Define the UNIQUE Initramfs path
         kver = subprocess.check_output(['uname', '-r'], text=True).strip()
-        initrd_path = f"/boot/initramfs-{kver}.img"
+        migration_img = f"/boot/initramfs-las-{name}.img"
         
-        print(f"[*] Injecting assembly hook into {initrd_path}...")
+        print(f"[*] Building isolated Initramfs: {migration_img}")
+        
+        # 3. Use Dracut to build the isolated image
+        # --include: puts our hook into the pre-mount directory
+        # --add-drivers: ensures dm-raid and raid1 are physically present
+        # --install: ensures dmsetup is available in the shell
         subprocess.run([
             'sudo', 'dracut', '--force',
             '--add', 'dm',
+            '--add-drivers', 'dm-raid raid1',
             '--install', 'dmsetup',
-            '--include', hook_path, '/usr/lib/dracut/hooks/pre-mount/99-las-assemble.sh',
-            initrd_path, kver
-        ], check=True)
+            '--include', hook_path, f'/usr/lib/dracut/hooks/pre-mount/99-las-assemble-{name}.sh',
+            migration_img, kver
+        ], check=True, capture_output=True)
         
-        print("[SUCCESS] Dracut hook injected.")
+        # Clean up the temp file
+        if os.path.exists(hook_path):
+            os.remove(hook_path)
+            
+        return migration_img
+
+    except subprocess.CalledProcessError as e:
+        print(f"[!] Dracut failed: {e.stderr.decode()}")
+        return None
+    except Exception as e:
+        print(f"[!] Error creating migration image: {e}")
+        return None
+
+def remove_las_assembly_hook(name):
+    """
+    Removes the LAS hook and rebuilds the Initramfs to a standard state.
+    """
+    try:
+        kver = subprocess.check_output(['uname', '-r'], text=True).strip()
+        initrd_path = f"/boot/initramfs-{kver}.img"
+        
+        print(f"[*] Removing LAS hook for '{name}' and restoring Initramfs...")
+        
+        # We run dracut without the --include flag. 
+        # This effectively rebuilds the image based on the system's standard 
+        # configuration, dropping our custom script.
+        subprocess.run(['sudo', 'dracut', '--force', initrd_path, kver], check=True)
+        
+        print(f"[SUCCESS] Initramfs restored. LAS hook removed.")
         return True
     except Exception as e:
-        print(f"[!] Failed to inject hook: {e}")
+        print(f"[!] Failed to clean Initramfs: {e}")
         return False
+    
+
+def get_root_filesystem_info(dev):
+    """
+    Detects the filesystem type and necessary mount flags (like subvolumes).
+    """
+    try:
+        # Get the Type (xfs, btrfs, ext4)
+        fstype_res = subprocess.run(
+            ['blkid', '-o', 'value', '-s', 'TYPE', dev],
+            capture_output=True, text=True, check=True
+        )
+        fstype = fstype_res.stdout.strip()
+
+        # Default flags
+        flags = "rw,relatime"
+
+        # Special handling for Btrfs (Fedora/OpenSUSE)
+        if fstype == "btrfs":
+            # We look for the 'root' subvolume which is standard on Fedora
+            flags += ",subvol=root"
+
+        return fstype, flags
+    except Exception as e:
+        print(f"[!] Warning: Could not detect filesystem for {dev}: {e}")
+        return "auto", "rw"
+    
+def get_root_device():
+    """
+    Finds the underlying partition device for the current root (/).
+    Returns a path like /dev/sda3 or /dev/nvme0n1p3.
+    """
+    try:
+        with open("/proc/mounts", "r") as f:
+            for line in f:
+                parts = line.split()
+                # Find the entry where the mount point is exactly '/'
+                if len(parts) > 1 and parts[1] == "/":
+                    return parts[0]
+    except Exception as e:
+        print(f"[!] Error detecting root device: {e}")
+    return None
