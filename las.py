@@ -25,39 +25,6 @@ import subprocess
 import database
 import os
 
-def clear_clones(dest_device):
-    """
-    Identifies and lazy-unmounts any partitions on the destination 
-    disk that the OS accidentally mounted due to UUID collisions.
-    """
-    print(f"[*] Checking for ghost mounts on {dest_device}...")
-    try:
-        # Get all child partitions and their mountpoints for the dest disk
-        # Output format: /dev/sdd2 /boot
-        lsblk_out = subprocess.check_output(
-            ["lsblk", "-ln", "-o", "NAME,MOUNTPOINT", dest_device], 
-            text=True
-        )
-        
-        for line in lsblk_out.splitlines():
-            parts = line.split()
-            if len(parts) < 2:
-                continue # No mountpoint for this partition
-            
-            dev_name, mnt_point = parts[0], parts[1]
-            
-            if mnt_point == "/":
-                print(f"[!] CRITICAL: {dev_name} is mounted as ROOT. Cannot revert safely!")
-                return False
-                
-            print(f"[*] Found ghost mount: {mnt_point} on {dev_name}. Performing lazy unmount...")
-            # -l (lazy) detaches the filesystem immediately from the tree
-            subprocess.run(["sudo", "umount", "-l", mnt_point], check=True)
-            
-        return True
-    except subprocess.CalledProcessError:
-        print("[*] No active mounts found on destination disk.")
-        return True
 
 def revert_migration(name):
     """
@@ -76,10 +43,6 @@ def revert_migration(name):
         return False
 
     print(f"[*] Starting revert for migration: {name}")
-
-    # 2. Clear Ghost Mounts (The 'sdd' Lock Fix)
-    if not clear_clones(record['dest']):
-        return False
 
     # 3. Cleanup: Boom Profile and Initramfs
     try:
@@ -104,15 +67,6 @@ def revert_migration(name):
             except:
                 subprocess.run(["sudo", "dd", "if=/dev/zero", f"of={disk}", "bs=1M", "count=1", "oflag=direct"], check=True)
 
-    # 5. REMOUNT ORIGINAL PARTITIONS
-    # Now that the collision is gone, we trigger a mount -a to 
-    # re-establish the connection to /dev/sda
-    print("[*] Re-establishing mounts from /etc/fstab to original disk...")
-    try:
-        subprocess.run(["sudo", "mount", "-a"], check=True)
-        print("[OK] Original partitions (/home, /boot) are now active.")
-    except subprocess.CalledProcessError:
-        print("[!] Warning: 'mount -a' failed. You may need to mount manually.")
 
     # 6. Database Cleanup
     database.delete_migration(name)
