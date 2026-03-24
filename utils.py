@@ -71,17 +71,16 @@ def get_persistent_path(dev_path):
 def inject_las_assembly_hook(name, p_orig, p_dest, p_m_orig, p_m_dest):
     """
     Creates a self-assembling Dracut hook for Lift and Shift (LAS).
-    This script runs inside the Initrd to build the RAID pair at boot.
+    Fixed: Removed 'nosync' to allow 'rebuild 1' to function.
     """
     
-    # The shell script that will execute during the 'pre-mount' phase of boot
     hook_content = f"""#!/bin/sh
 # LAS Dynamic Assembly Hook (Lift and Shift)
 
 echo "LAS: Starting hardware discovery..."
 udevadm settle --timeout=30
 
-# Wait for the primary source disk (/dev/disk/by-id/...)
+# Wait for the primary source disk
 i=0
 while [ $i -lt 15 ]; do
     [ -e "{p_orig}" ] && break
@@ -97,11 +96,10 @@ if [ -e "{p_orig}" ]; then
     
     # 2. Define the RAID Table
     # Parameters: 
-    # 4 1024: 4 optional parameters, 1024 region size
-    # nosync: Do not start background synchronization automatically
+    # 3 1024: 3 optional parameters (region_size, rebuild, 1), 1024 region size
     # rebuild 1: Force all reads from Leg 0 ({p_orig}) to prevent Btrfs csum errors
     # 2: Two pairs of (Metadata, Data) follow
-    TABLE="0 $SIZE raid raid1 4 1024 nosync rebuild 1 2 {p_m_orig} {p_orig} {p_m_dest} {p_dest}"
+    TABLE="0 $SIZE raid raid1 3 1024 rebuild 1 2 {p_m_orig} {p_orig} {p_m_dest} {p_dest}"
     
     echo "LAS: Assembling /dev/mapper/{name}..."
     echo "$TABLE" | dmsetup create {name}
@@ -111,7 +109,6 @@ if [ -e "{p_orig}" ]; then
     
     if [ -e "/dev/mapper/{name}" ]; then
         echo "LAS: Scanning for partitions on {name}..."
-        # This creates the /dev/mapper/{name}1, {name}2, {name}3 nodes
         partprobe "/dev/mapper/{name}" 2>/dev/null
         
         # Final settle ensures systemd mount units 'see' the device
@@ -121,7 +118,6 @@ if [ -e "{p_orig}" ]; then
     fi
 else
     echo "LAS: CRITICAL ERROR - Source disk {p_orig} not found!"
-    # Dropping to shell for manual recovery
     exit 1
 fi
 """

@@ -8,7 +8,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 """
-database interactions.
+database interactions for LAS (Lift and Shift) migrations.
 """
 import sqlite3
 import os
@@ -25,6 +25,7 @@ def _get_conn():
 def init_db():
     """Creates the migration table if it doesn't already exist."""
     with _get_conn() as conn:
+        # Added fstype and fsflags to persist the mount environment
         conn.execute("""
             CREATE TABLE IF NOT EXISTS migrations (
                 name TEXT PRIMARY KEY,
@@ -32,20 +33,22 @@ def init_db():
                 dest TEXT NOT NULL,
                 meta_orig TEXT NOT NULL,
                 meta_dest TEXT NOT NULL,
-                throttle INTEGER,
+                fstype TEXT,
+                fsflags TEXT,
+                throttle INTEGER DEFAULT 0,
                 active INTEGER DEFAULT 0
             )
         """)
 
-def record_migration(name, orig, dest, meta_orig, meta_dest, throttle):
-    """Saves or updates a migration record."""
+def record_migration(name, orig, dest, meta_orig, meta_dest, throttle=0, fstype=None, fsflags=None):
+    """Saves or updates a migration record including filesystem metadata."""
     init_db()
     with _get_conn() as conn:
         conn.execute("""
             INSERT OR REPLACE INTO migrations 
-            (name, orig, dest, meta_orig, meta_dest, throttle, active)
-            VALUES (?, ?, ?, ?, ?, ?, 1)
-        """, (name, orig, dest, meta_orig, meta_dest, throttle))
+            (name, orig, dest, meta_orig, meta_dest, throttle, fstype, fsflags, active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+        """, (name, orig, dest, meta_orig, meta_dest, throttle, fstype, fsflags))
         conn.commit()
 
 def get_migration(name):

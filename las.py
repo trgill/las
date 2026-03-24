@@ -74,6 +74,20 @@ def prepare_root(engine, name, origin, dest, meta_orig, meta_dest):
         print(f"[!] Could not detect live filesystem info: {e}")
         return False
 
+    # 6. DATABASE UPDATE
+    # We record the state before rebooting so the 'sync' command 
+    # knows which devices belong to this migration.
+    print("[*] Updating migration database...")
+    database.record_migration(
+        name=name,
+        orig=p_orig,
+        dest=p_dest,
+        meta_orig=p_m_orig,
+        meta_dest=p_m_dest,
+        throttle=0,
+        fstype=current_fstype,
+        fsflags=current_fsflags
+    )
     # 6. Register Boot Entry with the Engine
     # Passing the img_path, fstype, fsflags, and part_index as requested.
     if not engine.setup_boom_entry(img_path, current_fstype, current_fsflags, part_idx):
