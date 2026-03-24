@@ -12,80 +12,76 @@ las main.
 import os
 import argparse
 import sys
+import subprocess
 import time
 
 # Project modules
+import raid
 import utils
 import database
 from dm import RAIDEngine
 
 
-def prepare_root(engine, name, origin, dest, meta_orig, meta_dest, throttle=None):
+def prepare_root(engine, name, origin, dest, meta_orig, meta_dest):
     """
-    Main workflow to prepare the system for migration.
+    Main workflow for the Lift and Shift (LAS) root migration.
     """
-    import os
-    import utils
-    import database
+    print(f"[*] Starting Lift and Shift (LAS) preparation for: {name}")
 
-    # 1. Initialize RAID Metadata (The "Missing Leg" Strategy)
-    # This prepares the disks and calculates the usable sector count
-    if not engine.init_raid_metadata(origin, dest, meta_orig, meta_dest):
-        print("[!] RAID metadata initialization failed.")
+    # 1. Get exact size of the source disk for metadata priming
+    try:
+        origin_sz = int(subprocess.check_output(['blockdev', '--getsz', origin], text=True).strip())
+    except Exception as e:
+        print(f"[!] Could not determine size of {origin}: {e}")
         return False
 
-    # 2. Resolve ALL persistent paths (by-id)
-    # These are used for the RAID table and the 'wait' loop in the hook
+    # 2. Prime Source Metadata (Leg 0)
+    # Writes the binary identity to the metadata disk so the boot hook recognizes it.
+    raid.wipe_metadata(meta_orig)
+    if not raid.write_dm_raid_superblock(meta_orig, origin_sz):
+        print("[!] Failed to prime source metadata.")
+        return False
+
+    # 3. Resolve Persistent Paths (by-id)
+    # Used in the Dracut hook to ensure we find the right disks after reboot.
     p_orig = utils.get_persistent_path(origin)
     p_dest = utils.get_persistent_path(dest)
     p_m_orig = utils.get_persistent_path(meta_orig)
     p_m_dest = utils.get_persistent_path(meta_dest)
 
-    # 3. Construct the DM-RAID Table String
-    # 2 = optional parameter count (1024 and nosync)
-    raw_table = (
-        f"0 {engine.sectors} raid raid1 2 1024 nosync 2 "
-        f"{p_m_orig} {p_orig} {p_m_dest} {p_dest}"
-    )
-
-    # 4. Inject Hook and Create the ISOLATED Initramfs
-    # We pass the required disks so the hook knows exactly what to wait for
-    print(f"[*] Creating isolated migration Initramfs for '{name}'...")
-    required_disks = [p_m_orig, p_orig, p_m_dest, p_dest]
-    
-    custom_img = utils.inject_las_assembly_hook(name, raw_table, required_disks)
-    if not custom_img:
-        print("[!] Failed to create specialized Initramfs.")
+    # 4. Inject Assembly Hook & Create Initramfs
+    # Generates the self-assembling /boot/initramfs-las-{name}.img
+    img_path = utils.inject_las_assembly_hook(name, p_orig, p_dest, p_m_orig, p_m_dest)
+    if not img_path:
         return False
 
-    # 5. Detect Filesystem Info from the ACTIVE partition
-    # This finds if we are on Btrfs/XFS and gets the subvolume flags
-    root_partition = utils.get_root_device()
-    if not root_partition:
-        print("[!] Could not determine active root partition.")
+    # 5. Dynamic Filesystem Discovery
+    # We pull the FSTYPE and OPTIONS directly from the live '/' mount.
+    # This prevents hard-coding for Btrfs, XFS, or Ext4.
+    try:
+        # findmnt -n (no headings) -o (output columns)
+        cmd = ["findmnt", "-n", "-o", "FSTYPE,OPTIONS", "/"]
+        fs_info = subprocess.check_output(cmd, text=True).strip().split()
+        current_fstype = fs_info[0]
+        current_fsflags = fs_info[1]
+        
+        # Get the partition index (e.g., '3' if root is on /dev/sda3)
+        _, part_idx = utils.get_root_partition_info()
+        
+        print(f"[*] Detected {current_fstype} on partition {part_idx}")
+        print(f"[*] Using mount flags: {current_fsflags}")
+    except Exception as e:
+        print(f"[!] Could not detect live filesystem info: {e}")
         return False
 
-    print(f"[*] Detecting filesystem on {root_partition}...")
-    fstype, fsflags = utils.get_root_filesystem_info(root_partition)
-    print(f"[*] FS Info: type='{fstype}', flags='{fsflags}'")
-
-    # 6. CALL SETUP_BOOM_ENTRY
-    # This is the call you were looking for. It passes the custom image 
-    # and the detected filesystem metadata to the Boom CLI logic.
-    if not engine.setup_boom_entry(custom_img, fstype, fsflags):
-        print("[!] Failed to create Boom boot entry.")
-        # Cleanup the orphaned image if Boom failed to write the config
-        if os.path.exists(custom_img):
-            os.remove(custom_img)
+    # 6. Register Boot Entry with the Engine
+    # Passing the img_path, fstype, fsflags, and part_index as requested.
+    if not engine.setup_boom_entry(img_path, current_fstype, current_fsflags, part_idx):
+        print("[!] Failed to register Boom boot entry.")
         return False
 
-    # 7. Record the Migration to the Database
-    # This allows 'las list' and 'las break' to function later
-    database.record_migration(name, origin, dest, meta_orig, meta_dest, throttle)
-
-    print(f"\n[SUCCESS] Preparation complete for '{name}'.")
-    print(f"[INFO] Filesystem: {fstype} ({fsflags})")
-    print("[ACTION] Reboot and select the 'LAS-migration' entry from the GRUB menu.")
+    print(f"\n[SUCCESS] Lift and Shift prepared for '{name}'.")
+    print(f"[ACTION] Run: grub2-reboot 'LAS: {name}' && reboot")
     return True
 
 def main():

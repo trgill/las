@@ -68,68 +68,98 @@ def get_persistent_path(dev_path):
                     return full_link
     return dev_path
 
-def inject_las_assembly_hook(name, dm_table_string, wait_disks):
+def inject_las_assembly_hook(name, p_orig, p_dest, p_m_orig, p_m_dest):
     """
-    Creates a specialized, isolated Initramfs for LAS migration.
-    Dynamically waits for specific disks to prevent -ENOENT errors.
+    Creates a self-assembling Dracut hook for Lift and Shift (LAS).
+    This script runs inside the Initrd to build the RAID pair at boot.
     """
-    # Create the shell-script snippet that waits for each required disk
-    wait_logic = ""
-    for disk in wait_disks:
-        wait_logic += f"""
-    echo "LAS: Waiting for {disk}..."
-    i=0
-    while [ $i -lt 15 ]; do
-        [ -e "{disk}" ] && break
-        sleep 1
-        i=$((i+1))
-    done
-"""
-
-    # The actual hook script content
+    
+    # The shell script that will execute during the 'pre-mount' phase of boot
     hook_content = f"""#!/bin/sh
-# LAS Auto-Assembly Hook for {name}
-echo "LAS: Settling storage hardware..."
-udevadm settle --timeout=10
+# LAS Dynamic Assembly Hook (Lift and Shift)
 
-{wait_logic}
+echo "LAS: Starting hardware discovery..."
+udevadm settle --timeout=30
 
-if [ ! -e /dev/mapper/{name} ]; then
-    echo "LAS: Assembling RAID device '{name}'..."
-    echo "{dm_table_string}" | dmsetup create {name}
+# Wait for the primary source disk (/dev/disk/by-id/...)
+i=0
+while [ $i -lt 15 ]; do
+    [ -e "{p_orig}" ] && break
+    echo "LAS: Waiting for {p_orig}..."
+    sleep 1
+    i=$((i+1))
+done
+
+if [ -e "{p_orig}" ]; then
+    # 1. Get exact sector count from the live hardware
+    SIZE=$(blockdev --getsz {p_orig})
+    echo "LAS: Source {p_orig} found. Size: $SIZE sectors."
+    
+    # 2. Define the RAID Table
+    # Parameters: 
+    # 4 1024: 4 optional parameters, 1024 region size
+    # nosync: Do not start background synchronization automatically
+    # rebuild 1: Force all reads from Leg 0 ({p_orig}) to prevent Btrfs csum errors
+    # 2: Two pairs of (Metadata, Data) follow
+    TABLE="0 $SIZE raid raid1 4 1024 nosync rebuild 1 2 {p_m_orig} {p_orig} {p_m_dest} {p_dest}"
+    
+    echo "LAS: Assembling /dev/mapper/{name}..."
+    echo "$TABLE" | dmsetup create {name}
+    
+    # 3. Ensure the mapper node is created before scanning for partitions
+    udevadm settle
+    
+    if [ -e "/dev/mapper/{name}" ]; then
+        echo "LAS: Scanning for partitions on {name}..."
+        # This creates the /dev/mapper/{name}1, {name}2, {name}3 nodes
+        partprobe "/dev/mapper/{name}" 2>/dev/null
+        
+        # Final settle ensures systemd mount units 'see' the device
+        udevadm settle
+    else
+        echo "LAS: ERROR - Failed to create /dev/mapper/{name}"
+    fi
+else
+    echo "LAS: CRITICAL ERROR - Source disk {p_orig} not found!"
+    # Dropping to shell for manual recovery
+    exit 1
 fi
 """
-    
-    hook_path = f"/tmp/99-las-assemble-{name}.sh"
+
+    hook_filename = f"99-las-assemble-{name}.sh"
+    tmp_hook_path = os.path.join("/tmp", hook_filename)
     
     try:
-        # 1. Write the temporary hook script
-        with open(hook_path, "w") as f:
+        # Write the hook to a temporary file
+        with open(tmp_hook_path, "w") as f:
             f.write(hook_content)
-        os.chmod(hook_path, 0o755)
+        os.chmod(tmp_hook_path, 0o755)
 
-        # 2. Define the UNIQUE Initramfs path
+        # Determine current kernel version
         kver = subprocess.check_output(['uname', '-r'], text=True).strip()
         migration_img = f"/boot/initramfs-las-{name}.img"
         
-        print(f"[*] Building isolated Initramfs: {migration_img}")
+        print(f"[*] Generating LAS Initramfs: {migration_img}")
         
-        # 3. Use Dracut to build the isolated image
-        # --include: puts our hook into the pre-mount directory
-        # --add-drivers: ensures dm-raid and raid1 are physically present
-        # --install: ensures dmsetup is available in the shell
+        # Build the image with Dracut
+        # --add dm: Ensures Device Mapper support is present
+        # --add-drivers: Ensures raid1 and dm-raid modules are loaded
+        # --install: Explicitly copies binaries needed by our hook
+        # --include: Places our hook in the Dracut pre-mount directory
         subprocess.run([
             'sudo', 'dracut', '--force',
             '--add', 'dm',
             '--add-drivers', 'dm-raid raid1',
-            '--install', 'dmsetup',
-            '--include', hook_path, f'/usr/lib/dracut/hooks/pre-mount/99-las-assemble-{name}.sh',
+            '--install', 'dmsetup', 
+            '--install', 'partprobe',
+            '--install', 'blockdev',
+            '--include', tmp_hook_path, f'/usr/lib/dracut/hooks/pre-mount/{hook_filename}',
             migration_img, kver
         ], check=True, capture_output=True)
         
-        # Clean up the temp file
-        if os.path.exists(hook_path):
-            os.remove(hook_path)
+        # Clean up the temporary hook file
+        if os.path.exists(tmp_hook_path):
+            os.remove(tmp_hook_path)
             
         return migration_img
 
@@ -137,7 +167,7 @@ fi
         print(f"[!] Dracut failed: {e.stderr.decode()}")
         return None
     except Exception as e:
-        print(f"[!] Error creating migration image: {e}")
+        print(f"[!] Error injecting LAS hook: {e}")
         return None
 
 def remove_las_assembly_hook(name):
@@ -202,3 +232,41 @@ def get_root_device():
     except Exception as e:
         print(f"[!] Error detecting root device: {e}")
     return None
+
+def get_root_partition_info():
+    """
+    Uses findmnt to identify the root device and extract the partition index.
+    Returns a tuple: (full_path, index) e.g. ("/dev/sda3", "3")
+    """
+    import subprocess
+    import re
+
+    try:
+        # Get the source device for the root mount
+        # -n (no headings), -o SOURCE (only the device path)
+        root_dev = subprocess.check_output(
+            ['findmnt', '-n', '-o', 'SOURCE', '/'], 
+            text=True
+        ).strip()
+
+        # Extract the trailing digit (partition index)
+        # Works for /dev/sda3 -> 3, or /dev/nvme0n1p3 -> 3
+        match = re.search(r'(\d+)$', root_dev)
+        part_index = match.group(1) if match else "3"
+        
+        return root_dev, part_index
+    except Exception as e:
+        print(f"[!] Error detecting root with findmnt: {e}")
+        return "/dev/sda3", "3" # Fallback for standard Fedora
+    
+def prime_source_metadata(engine, origin, meta_orig):
+    """
+    Writes a minimal DM-RAID superblock to the source metadata device.
+    This ensures the boot hook has a 'valid' starting point.
+    """
+    # 1. Zero out the start of the source metadata to clear old junk
+    engine.wipe_metadata(meta_orig)
+    
+    # 2. Write the RAID superblock to meta_orig
+    # This identifies 'origin' as the valid data source.
+    return engine.write_dm_raid_superblock(meta_orig, origin_uuid=engine.get_uuid(origin))

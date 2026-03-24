@@ -78,7 +78,7 @@ class RAIDEngine:
             print(f"[!] Metadata priming failed: {e}")
             return False
 
-    def setup_boom_entry(self, img_path, fstype, fsflags):
+    def setup_boom_entry(self, img_path, fstype, fsflags, part_index):
         """
         Creates a Boom boot entry using the custom migration initramfs.
         Uses --add-opts and --no-dev to ensure the entry is written correctly.
@@ -93,23 +93,34 @@ class RAIDEngine:
         fstype = fstype if fstype else "auto"
         fsflags = fsflags if fsflags else "rw"
 
+        separator = 'p' if self.name[-1].isdigit() else ''
+        target_partition = f"/dev/mapper/{self.name}{separator}{part_index}"
+
         # 4. Construct the RAID/FS options
         # We use a single string to pass to --add-opts
         opts = (
             f"rd.driver.pre=dm-raid rd.timeout=60 "
             f"rootfstype={fstype} rootflags={fsflags} "
             f"SYSTEMD_SULOGIN_FORCE=1 rd.shell "
-            f"console=tty0 loglevel=7"
+            f"loglevel=7 "
+            f"console=tty0 console=ttyS0,115200"
         )
+
+        rel_img_path = img_path
+        if img_path.startswith("/boot"):
+            rel_img_path = img_path.replace("/boot", "", 1)
+        
+        # Clean up double slashes if they occur
+        rel_img_path = rel_img_path.replace("//", "/")
         
         # 5. Build the command using short flags to avoid ambiguity
         # -v = --version, -i = --initramfs
         cmd = [
             'sudo', 'boom', 'entry', 'create', 
             '--title', f'LAS-{self.name}',
-            '--root-device', f'/dev/mapper/{self.name}',
+            '--root-device', target_partition,
             '-v', kver,
-            '-i', img_path,
+            '-i', rel_img_path,
             '--add-opts', opts,
             '--no-dev'  # Critical: allows creating entry for non-existent /dev/mapper/device
         ]
@@ -130,6 +141,7 @@ class RAIDEngine:
         except Exception as e:
             print(f"[!] Exception during Boom execution: {e}")
             return False
+
     def activate_passive(self, orig, dest, m_orig, m_dest):
         """Creates a RAID1 target in 'nosync' mode for safe LUN adoption."""
         size = utils.get_block_size(orig)
@@ -223,3 +235,4 @@ class RAIDEngine:
                 ["sudo", "dmsetup", "remove", self.name], capture_output=True
             ).returncode == 0
         )
+    

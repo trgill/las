@@ -1,45 +1,41 @@
-# LAS (Live Array Storage) Migration Tool
+# LAS: Lift and Shift - TESTING ONLY
 
-**LAS** is a specialized utility designed to migrate a running Linux system from a single block device to a mirrored **DM-RAID1** array without downtime. It uses an isolated "Pre-flight" boot strategy to ensure the migration is successful before any permanent changes are made to the system's primary boot configuration.
+## ⚠️ WARNING: EXPERIMENTAL SOFTWARE
 
-## 🚀 Key Features
+**LAS (Lift and Shift)** is currently in **Alpha** status. This tool performs low-level manipulation of block devices, kernel boot parameters, and Initramfs structures. 
 
-* **Missing Leg Strategy:** Initializes a RAID1 mirror using the existing data as the "source of truth," cloning metadata to a new drive while keeping the original data intact.
-* **Isolated Initramfs:** Generates a standalone `initramfs` containing a custom Dracut hook. This hook handles the RAID assembly and device-mapper discovery before the root filesystem is mounted.
-* **Boom Integration:** Uses the `boom` boot manager to create a temporary, safe GRUB entry. If the RAID fails to assemble, the system remains bootable via the original standard kernel entries.
-* **Persistent Pathing:** Automatically resolves `by-id` paths for all RAID members to ensure boot-time stability, even if drive letters (`/dev/sdX`) change.
-* **Btrfs/XFS Awareness:** Automatically detects filesystem types and subvolume flags (e.g., `subvol=root`) to ensure the kernel can pivot to the new RAID device.
-
----
-
-## 🏗 Architecture
-
-The migration happens in three distinct phases:
-
-1.  **Preparation (`prepare-root`):**
-    * Detects the active root partition and filesystem parameters.
-    * Initializes RAID metadata on the destination and metadata drives.
-    * Injects a custom assembly script into a new, isolated `initramfs`.
-    * Creates a `boom` boot entry pointing to the new RAID mapper.
-
-2.  **The Pivot (Reboot):**
-    * The user selects the **LAS-migration** entry in GRUB.
-    * The custom hook waits for the physical disks to appear, assembles `/dev/mapper/migration`, and pivots the root to the array.
-
-3.  **Synchronization (Post-Boot):**
-    * Once booted into the RAID, the user can begin the background rebuild to synchronize the mirrors.
+* **DATA LOSS RISK:** Incorrect usage can result in an unbootable system or permanent data corruption.
+* **NO WARRANTY:** This software is provided "as is," without warranty of any kind. 
+* **REQUIREMENTS:**
+    * Always perform a full backup of your data before attempting a migration.
+    * Testing in a Virtual Machine (KVM/QEMU) is **strongly recommended** before running on bare metal.
+    * Familiarity with the Linux Emergency Shell and `dmsetup` is required for recovery in case of failure.
 
 ---
 
-## 🛠 Usage
+## Overview
+**LAS** is a specialized utility designed to migrate a running Linux root filesystem onto a RAID-1 mirror with minimal downtime. It achieves this by intercepting the boot process via a custom Initramfs hook, assembling a degraded DM-RAID device, and pivoting the root mount to the new mirrored structure.
 
-### 1. Prepare the Migration
-Replace the device paths with your actual hardware IDs.
+## Status Report: March 19–20 Milestones
+During this period, the project shifted from static configuration to a dynamic, self-assembling architecture:
+
+* **Dynamic Initramfs Generation:** Switched to a custom Dracut-based image generation strategy. The system now injects a specialized hook (`99-las-assemble-migration.sh`) into the pre-mount phase.
+* **Tooling Injection:** Automated the inclusion of `dmsetup`, `partprobe`, and `blockdev` into the bootloader environment.
+* **Read Stability (The `rebuild 1` Fix):** Implemented the `rebuild 1` flag in the DM-RAID table to force the kernel to read exclusively from the original source disk, successfully resolving Btrfs checksum (`csum`) errors.
+* **Partition Discovery:** Resolved "Missing Device" timeouts by integrating `udevadm settle` and `partprobe` within the boot hook, ensuring `/dev/mapper/migrationX` nodes are populated before the real root is mounted.
+
+## Usage
+The primary entry point is `las.py`. 
 
 ```bash
-sudo ./las.py prepare-root \
-  --name migration \
-  --orig /dev/sda \
-  --dest /dev/sdd \
-  --meta-orig /dev/sdc \
-  --meta-dest /dev/sdb
+./las.py prepare-root --name migration --orig /dev/sda --dest /dev/sdd --meta-orig /dev/sdc --meta-dest /dev/sdb
+```
+
+### Core Components
+* **`las.py`**: Main orchestrator for the Lift and Shift workflow.
+* **`utils.py`**: Handles Dracut hook injection and persistent device path resolution.
+* **`dm.py`**: Manages Device Mapper table generation and Boom/Bootloader configurations.
+
+---
+
+**Would you like me to add a "Troubleshooting" section specifically for the Btrfs metadata errors we solved last week?**
