@@ -103,6 +103,7 @@ class RAIDEngine:
             f"rootfstype={fstype} rootflags={fsflags} "
             f"SYSTEMD_SULOGIN_FORCE=1 rd.shell "
             f"loglevel=7 "
+            f"raid.speed_limit_max=5000 "
             f"console=tty0 console=ttyS0,115200"
         )
 

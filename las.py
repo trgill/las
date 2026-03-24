@@ -21,6 +21,142 @@ import utils
 import database
 from dm import RAIDEngine
 
+import subprocess
+import database
+import os
+
+def revert_migration(name):
+    """
+    Cleans up LAS metadata and boot entries. 
+    User must be booted into the original /dev/sda (non-DM) to run this safely.
+    """
+    import database
+    import subprocess
+    import os
+
+    # 1. Safety Check: Are we currently running on the RAID?
+    # We check if the root mount is a DM device named after the migration
+    try:
+        root_dev = subprocess.check_output(["findmnt", "-n", "-o", "SOURCE", "/"], text=True).strip()
+        if name in root_dev:
+            print(f"[!] ERROR: You are currently booted into the RAID device ({root_dev}).")
+            print("[!] Please reboot and select your ORIGINAL boot entry before reverting.")
+            return False
+    except Exception as e:
+        print(f"[!] Warning: Could not verify current root device: {e}")
+
+    # 2. Fetch the record
+    record = database.get_migration(name)
+    if not record:
+        print(f"[!] No migration record found for: {name}")
+        return False
+
+    print(f"[*] Reverting migration '{name}'...")
+
+    # 3. Remove Boom Boot Profile
+    try:
+        title = f"LAS: {name}"
+        print(f"[*] Removing Boom entry: {title}")
+        subprocess.run(["sudo", "boom", "profile", "delete", "--title", title], check=True, capture_output=True)
+    except subprocess.CalledProcessError:
+        print("[!] Note: Boom profile already removed or not found.")
+
+    # 4. Delete the custom Initramfs
+    img_path = f"/boot/initramfs-las-{name}.img"
+    if os.path.exists(img_path):
+        print(f"[*] Removing Initramfs: {img_path}")
+        os.remove(img_path)
+
+    # 5. Wipe Metadata and Destination Disks
+    # We leave 'orig' alone! We only wipe the secondary 'dest' and the meta disks.
+    target_disks = [record['dest'], record['meta_orig'], record['meta_dest']]
+    for disk in target_disks:
+        if os.path.exists(disk):
+            print(f"[*] Wiping signatures on {disk}...")
+            # This clears RAID superblocks so the disk looks 'empty' again
+            subprocess.run(["sudo", "wipefs", "-a", disk], check=True)
+
+    # 6. Final Database Cleanup
+    database.delete_migration(name)
+    
+    print(f"\n[SUCCESS] Revert complete. System is back to its original state.")
+    return True
+
+def list_migrations():
+    migrations = database.list_all_migrations()
+    if not migrations:
+        print("[*] No migrations found in database.")
+    else:
+        print(f"{'Name':<15} {'Source':<15} {'Dest':<18} {'Progress'}")
+        print("-" * 60)
+        for m in migrations:
+            temp_engine = RAIDEngine(m['name'])
+            _, pct = temp_engine.get_status()
+            print(f"{m['name']:<15} {m['orig']:<15} {m['dest']:<18} {pct}")
+
+def show_status(name):
+    """
+    Displays the live status of a migration, including sync progress
+    and current boot state.
+    """
+    print(f"🔍 Checking LAS Migration Status: {name}")
+    print("-" * 40)
+
+    # 1. Check Database Record
+    record = database.get_migration(name)
+    if not record:
+        print(f"[!] No record found in database for '{name}'.")
+        return
+
+    # 2. Check Current Boot State
+    try:
+        root_dev = subprocess.check_output(["findmnt", "-n", "-o", "SOURCE", "/"], text=True).strip()
+        is_on_raid = name in root_dev
+        print(f"[*] Boot State: {'RUNNING ON RAID' if is_on_raid else 'RUNNING ON ORIGIN'}")
+        print(f"[*] Root Device: {root_dev}")
+    except:
+        print("[!] Could not determine current boot state.")
+
+# 3. Check RAID Sync Progress (from the kernel)
+    try:
+        dm_status = subprocess.check_output(["sudo", "dmsetup", "status", name], text=True).strip()
+        parts = dm_status.split()
+        
+        # Find the part that looks like '83886080/83886080'
+        sync_info = next((p for p in parts if '/' in p), None)
+        
+        if sync_info:
+            curr, total = map(int, sync_info.split('/'))
+            percent = (curr / total) * 100
+            
+            # Health is usually at index 5 (e.g., 'AA')
+            health = parts[5] if len(parts) > 5 else "unknown"
+            
+            print(f"[*] RAID Health: {health} (A=Alive, D=Dead/Down)")
+            print(f"[*] Sync Progress: {percent:.2f}% ({curr} / {total} sectors)")
+            
+            # Check if we are idle vs rebuilding
+            if "idle" in parts:
+                print("[SUCCESS] Status: FULLY SYNCED (Idle)")
+            else:
+                print("[!] Status: REBUILDING/SYNCING")
+    except StopIteration:
+        print("[!] Could not find sync progress in dmsetup output.")
+    except Exception as e:
+        print(f"[!] Error parsing RAID status: {e}")
+
+    # 4. Actionable Advice
+    print("-" * 40)
+    if is_on_raid:
+        if "percent" in locals() and percent >= 100:
+            print("👉 Recommendation: Run 'las break' to finalize migration.")
+            print("   Or reboot to origin if you want to revert migration.")
+        else:
+            print("👉 Recommendation: Wait for sync to hit 100% or adjust throttle.")
+    else:
+        print("👉 Recommendation: Reboot and select the 'LAS' entry to start migration.")
+        print("   Or run 'las revert' to clean up if you've changed your mind.")
+
 
 def prepare_root(engine, name, origin, dest, meta_orig, meta_dest):
     """
@@ -146,6 +282,9 @@ def main():
     brk = subparsers.add_parser('break', help='Finalize and remove mirror')
     brk.add_argument('--name', default='migration')
 
+    rvt = subparsers.add_parser('revert', help='Revert to origin and cleanup migration metadata')
+    rvt.add_argument('--name', required=True, help='Name of the migration to revert')
+
     # Parse arguments after ALL subparsers are added
     args = parser.parse_args()
 
@@ -160,28 +299,13 @@ def main():
     # --- COMMAND LOGIC ---
 
     if args.command == 'list':
-        migrations = database.list_all_migrations()
-        if not migrations:
-            print("[*] No migrations found in database.")
-        else:
-            print(f"{'Name':<15} {'Source':<15} {'Dest':<18} {'Progress'}")
-            print("-" * 60)
-            for m in migrations:
-                temp_engine = RAIDEngine(m['name'])
-                _, pct = temp_engine.get_status()
-                print(f"{m['name']:<15} {m['orig']:<15} {m['dest']:<18} {pct}")
+        list_migrations()
 
     elif args.command == 'status':
-        try:
-            while True:
-                raw, pct = engine.get_status()
-                print(f"[{name}] Progress: {pct} | Kernel info: {raw}")
-                if not args.wait or "100.00%" in pct:
-                    break
-                time.sleep(5)
-        except KeyboardInterrupt:
-            print("\n[*] Monitoring stopped.")
+        show_status(args.name)
 
+    elif args.command == 'revert':
+        revert_migration(args.name)
     # --- LOGIC: prepare-root ---
     # This command prepares a system for a "Pivot-on-Reboot" migration.
     elif args.command == 'prepare-root':
