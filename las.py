@@ -25,61 +25,99 @@ import subprocess
 import database
 import os
 
+def clear_clones(dest_device):
+    """
+    Identifies and lazy-unmounts any partitions on the destination 
+    disk that the OS accidentally mounted due to UUID collisions.
+    """
+    print(f"[*] Checking for ghost mounts on {dest_device}...")
+    try:
+        # Get all child partitions and their mountpoints for the dest disk
+        # Output format: /dev/sdd2 /boot
+        lsblk_out = subprocess.check_output(
+            ["lsblk", "-ln", "-o", "NAME,MOUNTPOINT", dest_device], 
+            text=True
+        )
+        
+        for line in lsblk_out.splitlines():
+            parts = line.split()
+            if len(parts) < 2:
+                continue # No mountpoint for this partition
+            
+            dev_name, mnt_point = parts[0], parts[1]
+            
+            if mnt_point == "/":
+                print(f"[!] CRITICAL: {dev_name} is mounted as ROOT. Cannot revert safely!")
+                return False
+                
+            print(f"[*] Found ghost mount: {mnt_point} on {dev_name}. Performing lazy unmount...")
+            # -l (lazy) detaches the filesystem immediately from the tree
+            subprocess.run(["sudo", "umount", "-l", mnt_point], check=True)
+            
+        return True
+    except subprocess.CalledProcessError:
+        print("[*] No active mounts found on destination disk.")
+        return True
+
 def revert_migration(name):
     """
-    Cleans up LAS metadata and boot entries. 
-    User must be booted into the original /dev/sda (non-DM) to run this safely.
+    Cleans up LAS metadata and boot entries and ensures 
+    the original partitions are remounted correctly.
     """
-    import database
-    import subprocess
-    import os
-
-    # 1. Safety Check: Are we currently running on the RAID?
-    # We check if the root mount is a DM device named after the migration
-    try:
-        root_dev = subprocess.check_output(["findmnt", "-n", "-o", "SOURCE", "/"], text=True).strip()
-        if name in root_dev:
-            print(f"[!] ERROR: You are currently booted into the RAID device ({root_dev}).")
-            print("[!] Please reboot and select your ORIGINAL boot entry before reverting.")
-            return False
-    except Exception as e:
-        print(f"[!] Warning: Could not verify current root device: {e}")
-
-    # 2. Fetch the record
     record = database.get_migration(name)
     if not record:
         print(f"[!] No migration record found for: {name}")
         return False
 
-    print(f"[*] Reverting migration '{name}'...")
+    # 1. Safety Check: Ensure we aren't currently running ON the RAID
+    root_dev = subprocess.check_output(["findmnt", "-n", "-o", "SOURCE", "/"], text=True).strip()
+    if name in root_dev:
+        print(f"[!] ERROR: You are still booted into the RAID ({root_dev}).")
+        return False
 
-    # 3. Remove Boom Boot Profile
+    print(f"[*] Starting revert for migration: {name}")
+
+    # 2. Clear Ghost Mounts (The 'sdd' Lock Fix)
+    if not clear_clones(record['dest']):
+        return False
+
+    # 3. Cleanup: Boom Profile and Initramfs
     try:
-        title = f"LAS: {name}"
-        print(f"[*] Removing Boom entry: {title}")
-        subprocess.run(["sudo", "boom", "profile", "delete", "--title", title], check=True, capture_output=True)
-    except subprocess.CalledProcessError:
-        print("[!] Note: Boom profile already removed or not found.")
+        subprocess.run(["sudo", "boom", "profile", "delete", "--title", f"LAS: {name}"], check=True, capture_output=True)
+        print("[OK] Removed Boom entry.")
+    except:
+        print("[!] Note: Boom profile not found.")
 
-    # 4. Delete the custom Initramfs
     img_path = f"/boot/initramfs-las-{name}.img"
     if os.path.exists(img_path):
-        print(f"[*] Removing Initramfs: {img_path}")
         os.remove(img_path)
+        print("[OK] Deleted custom Initramfs.")
 
-    # 5. Wipe Metadata and Destination Disks
-    # We leave 'orig' alone! We only wipe the secondary 'dest' and the meta disks.
+    # 4. Wipe Metadata and Destination Disks
+    subprocess.run(["sudo", "udevadm", "settle"], check=False)
     target_disks = [record['dest'], record['meta_orig'], record['meta_dest']]
     for disk in target_disks:
         if os.path.exists(disk):
             print(f"[*] Wiping signatures on {disk}...")
-            # This clears RAID superblocks so the disk looks 'empty' again
-            subprocess.run(["sudo", "wipefs", "-a", disk], check=True)
+            try:
+                subprocess.run(["sudo", "wipefs", "-a", "-f", disk], check=True)
+            except:
+                subprocess.run(["sudo", "dd", "if=/dev/zero", f"of={disk}", "bs=1M", "count=1", "oflag=direct"], check=True)
 
-    # 6. Final Database Cleanup
+    # 5. REMOUNT ORIGINAL PARTITIONS
+    # Now that the collision is gone, we trigger a mount -a to 
+    # re-establish the connection to /dev/sda
+    print("[*] Re-establishing mounts from /etc/fstab to original disk...")
+    try:
+        subprocess.run(["sudo", "mount", "-a"], check=True)
+        print("[OK] Original partitions (/home, /boot) are now active.")
+    except subprocess.CalledProcessError:
+        print("[!] Warning: 'mount -a' failed. You may need to mount manually.")
+
+    # 6. Database Cleanup
     database.delete_migration(name)
     
-    print(f"\n[SUCCESS] Revert complete. System is back to its original state.")
+    print(f"\n[SUCCESS] Revert complete. System is stable on {root_dev}.")
     return True
 
 def list_migrations():
