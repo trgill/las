@@ -156,6 +156,9 @@ def prepare_root(engine, name, origin, dest, meta_orig, meta_dest):
     """
     print(f"[*] Starting Lift and Shift (LAS) preparation for: {name}")
 
+    if not utils.validate_migration_geometry(origin, dest, meta_orig, meta_dest):
+        sys.exit(1)
+
     # 1. Get exact size of the source disk for metadata priming
     try:
         origin_sz = int(subprocess.check_output(['blockdev', '--getsz', origin], text=True).strip())

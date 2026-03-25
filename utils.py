@@ -68,19 +68,15 @@ def get_persistent_path(dev_path):
                     return full_link
     return dev_path
 
-def inject_las_assembly_hook(name, p_orig, p_dest, p_m_orig, p_m_dest):
-    """
-    Creates a self-assembling Dracut hook for Lift and Shift (LAS).
-    Fixed: Removed 'nosync' to allow 'rebuild 1' to function.
-    """
+def inject_las_assembly_hook(name, p_orig, p_dest, p_m_orig, p_m_dest, throttle_kibs=51200):
+    rate = throttle_kibs if throttle_kibs and throttle_kibs > 0 else 51200
+    max_rate = rate * 2
     
     hook_content = f"""#!/bin/sh
 # LAS Dynamic Assembly Hook (Lift and Shift)
-
 echo "LAS: Starting hardware discovery..."
 udevadm settle --timeout=30
 
-# Wait for the primary source disk
 i=0
 while [ $i -lt 15 ]; do
     [ -e "{p_orig}" ] && break
@@ -90,34 +86,24 @@ while [ $i -lt 15 ]; do
 done
 
 if [ -e "{p_orig}" ]; then
-    # 1. Get exact sector count from the live hardware
     SIZE=$(blockdev --getsz {p_orig})
     echo "LAS: Source {p_orig} found. Size: $SIZE sectors."
     
-    # 2. Define the RAID Table
-    # Parameters: 
-    # 3 1024: 3 optional parameters (region_size, rebuild, 1), 1024 region size
-    # rebuild 1: Force all reads from Leg 0 ({p_orig}) to prevent Btrfs csum errors
-    # 2: Two pairs of (Metadata, Data) follow
-    TABLE="0 $SIZE raid raid1 3 1024 rebuild 1 2 {p_m_orig} {p_orig} {p_m_dest} {p_dest}"
+    # Corrected Parameter Count: 7
+    TABLE="0 $SIZE raid raid1 7 1024 rebuild 1 min_recovery_rate {rate} max_recovery_rate {max_rate} 2 {p_m_orig} {p_orig} {p_m_dest} {p_dest}"
     
     echo "LAS: Assembling /dev/mapper/{name}..."
     echo "$TABLE" | dmsetup create {name}
     
-    # 3. Ensure the mapper node is created before scanning for partitions
     udevadm settle
-    
     if [ -e "/dev/mapper/{name}" ]; then
-        echo "LAS: Scanning for partitions on {name}..."
-        partprobe "/dev/mapper/{name}" 2>/dev/null
-        
-        # Final settle ensures systemd mount units 'see' the device
+        echo "LAS: Scanning for partitions..."
+        # Try full path, fallback to simple command
+        /usr/sbin/partprobe "/dev/mapper/{name}" 2>/dev/null || partprobe "/dev/mapper/{name}"
         udevadm settle
-    else
-        echo "LAS: ERROR - Failed to create /dev/mapper/{name}"
     fi
 else
-    echo "LAS: CRITICAL ERROR - Source disk {p_orig} not found!"
+    echo "LAS: CRITICAL ERROR - Source disk not found!"
     exit 1
 fi
 """
@@ -126,34 +112,30 @@ fi
     tmp_hook_path = os.path.join("/tmp", hook_filename)
     
     try:
-        # Write the hook to a temporary file
         with open(tmp_hook_path, "w") as f:
             f.write(hook_content)
         os.chmod(tmp_hook_path, 0o755)
 
-        # Determine current kernel version
         kver = subprocess.check_output(['uname', '-r'], text=True).strip()
         migration_img = f"/boot/initramfs-las-{name}.img"
         
         print(f"[*] Generating LAS Initramfs: {migration_img}")
         
-        # Build the image with Dracut
-        # --add dm: Ensures Device Mapper support is present
-        # --add-drivers: Ensures raid1 and dm-raid modules are loaded
-        # --install: Explicitly copies binaries needed by our hook
-        # --include: Places our hook in the Dracut pre-mount directory
-        subprocess.run([
+        # Build command
+        cmd = [
             'sudo', 'dracut', '--force',
             '--add', 'dm',
             '--add-drivers', 'dm-raid raid1',
-            '--install', 'dmsetup', 
-            '--install', 'partprobe',
-            '--install', 'blockdev',
+            '--install', 'dmsetup partprobe blockdev',
             '--include', tmp_hook_path, f'/usr/lib/dracut/hooks/pre-mount/{hook_filename}',
             migration_img, kver
-        ], check=True, capture_output=True)
+        ]
         
-        # Clean up the temporary hook file
+        subprocess.run(cmd, check=True, capture_output=True)
+        
+        # Ensure bits are on disk
+        subprocess.run(['sync'], check=True)
+        
         if os.path.exists(tmp_hook_path):
             os.remove(tmp_hook_path)
             
@@ -161,9 +143,6 @@ fi
 
     except subprocess.CalledProcessError as e:
         print(f"[!] Dracut failed: {e.stderr.decode()}")
-        return None
-    except Exception as e:
-        print(f"[!] Error injecting LAS hook: {e}")
         return None
 
 def remove_las_assembly_hook(name):
@@ -266,3 +245,36 @@ def prime_source_metadata(engine, origin, meta_orig):
     # 2. Write the RAID superblock to meta_orig
     # This identifies 'origin' as the valid data source.
     return engine.write_dm_raid_superblock(meta_orig, origin_uuid=engine.get_uuid(origin))
+
+def validate_migration_geometry(source_dev, dest_dev, meta_orig, meta_dest):
+    """
+    Checks all involved disks to ensure the migration will physically fit.
+    """
+    print(f"[*] Validating disk geometry for RAID assembly...")
+
+    # Get sector counts using your existing function
+    src_sectors = get_block_size(source_dev)
+    dest_sectors = get_block_size(dest_dev)
+    
+    # Metadata devices also need a minimum size (usually ~4096 sectors for RAID1 metadata)
+    meta_orig_sectors = get_block_size(meta_orig)
+    meta_dest_sectors = get_block_size(meta_dest)
+
+    print(f"    Source ({source_dev}): {src_sectors} sectors")
+    print(f"    Destination ({dest_dev}): {dest_sectors} sectors")
+
+    # 1. Check Primary Data Disk Size
+    if dest_sectors < src_sectors:
+        diff = src_sectors - dest_sectors
+        print(f"\n[!] ERROR: Destination disk {dest_dev} is TOO SMALL.")
+        print(f"    Missing {diff} sectors. Expand the disk in Virt-Manager.")
+        return False
+
+    # 2. Check Metadata Device Size (Safety check)
+    # RAID1 metadata usually needs at least 8 sectors, but we'll check for 1MB (2048 sectors)
+    if meta_orig_sectors < 2048 or meta_dest_sectors < 2048:
+        print(f"\n[!] ERROR: Metadata disks ({meta_orig}/{meta_dest}) are too small.")
+        return False
+
+    print("[OK] Geometry validation passed.")
+    return True
