@@ -2,9 +2,9 @@
 #
 # Copyright Red Hat
 #
-# snapm/_snapm.py - Snapshot Manager global definitions
+# database.py - Lift and Shift global definitions
 #
-# This file is part of the snapm project.
+# This file is part of the las project.
 #
 # SPDX-License-Identifier: Apache-2.0
 """

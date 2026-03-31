@@ -1,3 +1,10 @@
+# Copyright Red Hat
+#
+# raid.py - Lift and Shift RAID interface
+#
+# This file is part of the las project.
+#
+# SPDX-License-Identifier: Apache-2.0
 import struct
 import uuid
 import zlib
