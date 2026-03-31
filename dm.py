@@ -78,70 +78,119 @@ class RAIDEngine:
             print(f"[!] Metadata priming failed: {e}")
             return False
 
-    def setup_boom_entry(self, img_path, fstype, fsflags, part_index):
+    def setup_boom_entry(self, img_path, fstype, fsflags):
         """
-        Creates a Boom boot entry using the custom migration initramfs.
-        Uses --add-opts and --no-dev to ensure the entry is written correctly.
+        Creates a Boom entry for live migration.
+        Forces /boot to remain on the physical origin device while 
+        moving other partitions to the migration mapper.
         """
         import subprocess
         import os
+        import re
 
-        # 1. Get current kernel version
+        clean_name = self.name.strip().replace(']', '').replace('[', '')
+
+        # 1. Identify current root and partition index
+        try:
+            root_src = subprocess.check_output(['findmnt', '-n', '-o', 'SOURCE', '/'], text=True).strip()
+            root_src = root_src.replace(']', '').replace('[', '').strip()
+            
+            root_idx_match = re.search(r'(\d+)(?:/.*)?$', root_src)
+            if not root_idx_match:
+                print(f"[!] Could not find partition index for {root_src}")
+                return False
+            root_idx = root_idx_match.group(1)
+
+            # Detect the physical parent disk (e.g., sda)
+            disk_match = re.match(r'/dev/([a-z]+|nvme\d+n\d+)', root_src)
+            source_disk = disk_match.group(1) if disk_match else \
+                subprocess.check_output(f"lsblk -no PKNAME {root_src.split('/')[2]} | head -n1", shell=True, text=True).strip()
+        except Exception as e:
+            print(f"[!] Detection error: {e}")
+            return False
+
+        # 2. Define the target mapper for Root
+        separator = 'p' if clean_name[-1].isdigit() else ''
+        root_mapper = f"/dev/mapper/{clean_name}{separator}{root_idx}"
+
+        # 3. Process Mounts
+        migration_opts = "x-systemd.device-timeout=60s,nofail"
+        try:
+            mount_data = subprocess.check_output(['findmnt', '-l', '-n', '-o', 'TARGET,SOURCE,FSTYPE,OPTIONS'], text=True).splitlines()
+        except Exception as e:
+            print(f"[!] Mount scan error: {e}")
+            return False
+
+        mount_args = []
+        for line in mount_data:
+            parts = line.split(None, 3)
+            if len(parts) < 4: continue
+            target, source, mnt_fstype, mnt_opts = parts
+            
+            if target == "/": continue 
+            
+            # 1. Clean the source path
+            source = source.replace(']', '').replace('[', '').strip()
+            
+            # 2. Logic for /home on Btrfs
+            if target == "/home" and mnt_fstype == "btrfs":
+                # Ensure the subvolume flag is preserved or explicitly added
+                if "subvol=" not in mnt_opts:
+                    # If findmnt didn't show it, we force it based on the subvolume list
+                    mnt_opts += ",subvol=home"
+                
+                # We MUST use the mapper device for the RAID
+                dev_str = f"/dev/mapper/{clean_name}{separator}{root_idx}"
+            
+            # ... (rest of your logic for /boot on origin) ...
+
+            # 3. Mask the old unit and add the extra mount
+            unit_name = target.strip('/').replace('/', '-')
+            mount_args.append(f"systemd.mask={unit_name}.mount")
+            
+            # Sanitize and add
+            clean_opts = mnt_opts.replace(",seclabel", "").replace("zstd:1", "zstd")
+            final_opts = f"{clean_opts},{migration_opts}"
+            mount_args.append(f"systemd.mount-extra={dev_str}:{target}:{mnt_fstype}:{final_opts}")
+
+        # 4. Finalize Kernel Options
         kver = subprocess.check_output(['uname', '-r'], text=True).strip()
-
-        # 3. Ensure we have defaults if detection was fuzzy
-        fstype = fstype if fstype else "auto"
-        fsflags = fsflags if fsflags else "rw"
-
-        separator = 'p' if self.name[-1].isdigit() else ''
-        target_partition = f"/dev/mapper/{self.name}{separator}{part_index}"
-
-        # 4. Construct the RAID/FS options
-        # We use a single string to pass to --add-opts
-        opts = (
-            f"rd.driver.pre=dm-raid rd.timeout=60 "
-            f"rootfstype={fstype} rootflags={fsflags} "
-            f"SYSTEMD_SULOGIN_FORCE=1 rd.shell "
-            f"loglevel=7 "
-            f"raid.speed_limit_max=5000 "
-            f"console=tty0 console=ttyS0,115200"
-        )
-
-        rel_img_path = img_path
-        if img_path.startswith("/boot"):
-            rel_img_path = img_path.replace("/boot", "", 1)
+        clean_fsflags = fsflags.replace(",seclabel", "").replace("zstd:1", "zstd")
         
-        # Clean up double slashes if they occur
-        rel_img_path = rel_img_path.replace("//", "/")
-        
-        # 5. Build the command using short flags to avoid ambiguity
-        # -v = --version, -i = --initramfs
+        # Keep rd.fstab=0 to avoid duplicate mount attempts from the on-disk fstab
+        core_args = [
+            f"root={root_mapper} ro",
+            "rd.fstab=0 rd.retry=60 rootdelay=5",
+            "rd.driver.pre=dm-raid rd.timeout=60 rd.dm=1",
+            f"rootfstype={fstype if fstype else 'auto'}",
+            f"rootflags={clean_fsflags},device={root_mapper}",
+            "SYSTEMD_SULOGIN_FORCE=1 rd.shell loglevel=7"
+        ]
+
+        # Combine core args with our mount-extras and masks
+        all_args_list = core_args + mount_args
+
+        # Ensure Console settings are last
+        console_args = ["console=tty0", "console=ttyS0,115200"]
+        all_args_list += console_args
+
+        all_opts = " ".join(all_args_list)
+        rel_img_path = img_path.replace("/boot", "", 1) if img_path.startswith("/boot") else img_path
+
+        # 5. Create Boom Entry
         cmd = [
             'sudo', 'boom', 'entry', 'create', 
-            '--title', f'LAS-{self.name}',
-            '--root-device', target_partition,
+            '--title', f'LAS-{clean_name}',
+            '--root-device', root_mapper,
             '-v', kver,
-            '-i', rel_img_path,
-            '--add-opts', opts,
-            '--no-dev'  # Critical: allows creating entry for non-existent /dev/mapper/device
+            '-i', rel_img_path.replace("//", "/"),
+            '--add-opts', all_opts,
+            '--no-dev'
         ]
-        
 
-        try:
-            # Run the command and capture output for debugging
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            
-            if result.returncode != 0:
-                print("\n[!] Boom Command Failed!")
-                print(f"[#] STDOUT: {result.stdout.strip()}")
-                print(f"[#] STDERR: {result.stderr.strip()}")
-                return False
-                
-            return True
-
-        except Exception as e:
-            print(f"[!] Exception during Boom execution: {e}")
-            return False
+        print(f"[*] LAS Entry: Root on Mapper, Boot on Physical {source}")
+        subprocess.run(cmd, check=True)
+        return True
 
     def activate_passive(self, orig, dest, m_orig, m_dest):
         """Creates a RAID1 target in 'nosync' mode for safe LUN adoption."""

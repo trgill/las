@@ -86,73 +86,96 @@ def list_migrations():
             _, pct = temp_engine.get_status()
             print(f"{m['name']:<15} {m['orig']:<15} {m['dest']:<18} {pct}")
 
+def check_boot_state(name):
+    import subprocess
+    import re
+    
+    root_dev = "Unknown"
+    is_on_raid = False
+    
+    try:
+        # Get the source for /
+        root_dev_raw = subprocess.check_output(["findmnt", "-n", "-o", "SOURCE", "/"], text=True).strip()
+        
+        # Strip Btrfs subvolume notation: /dev/sda3[/root] -> /dev/sda3
+        root_dev = re.sub(r'[\[/].*$', '', root_dev_raw)
+        
+        # Check for mapper and name match
+        if "/dev/mapper/" in root_dev and name in root_dev:
+            is_on_raid = True
+            
+    except Exception as e:
+        root_dev = f"Error: {str(e)}"
+        
+    return is_on_raid, root_dev
+
 def show_status(name):
-    """
-    Displays the live status of a migration, including sync progress
-    and current boot state.
-    """
+    import subprocess
+    import os
+
     print(f"🔍 Checking LAS Migration Status: {name}")
     print("-" * 40)
 
-    # 1. Check Database Record
-    record = database.get_migration(name)
-    if not record:
-        print(f"[!] No record found in database for '{name}'.")
-        return
+    # 1. Use the dedicated check_boot_state
+    is_on_raid, root_dev = check_boot_state(name)
+    
+    state_str = "RUNNING ON RAID MIRROR" if is_on_raid else "RUNNING ON ORIGIN"
+    print(f"[*] Boot State:    {state_str}")
+    print(f"[*] Root Device:   {root_dev}")
 
-    # 2. Check Current Boot State
-    try:
-        root_dev = subprocess.check_output(["findmnt", "-n", "-o", "SOURCE", "/"], text=True).strip()
-        is_on_raid = name in root_dev
-        print(f"[*] Boot State: {'RUNNING ON RAID' if is_on_raid else 'RUNNING ON ORIGIN'}")
-        print(f"[*] Root Device: {root_dev}")
-    except:
-        print("[!] Could not determine current boot state.")
+    # 2. Check RAID Sync (Parent Device)
+    is_synced = False
+    if os.path.exists(f"/dev/mapper/{name}"):
+        try:
+            dm_status = subprocess.check_output(["sudo", "dmsetup", "status", name], text=True).strip()
+            parts = dm_status.split()
+            
+            # Health characters (e.g., 'AA', 'Aa') 
+            health = next((p for p in parts if len(p) == 2 and p.strip('AaR ') == ''), "??")
+            
+            # Sync info (e.g., 31613440/83886080)
+            sync_info = next((p for p in parts if '/' in p), None)
+            
+            if sync_info:
+                curr, total = map(int, sync_info.split('/'))
+                percent = (curr / total) * 100 if total > 0 else 0
+                
+                print(f"[*] RAID Health:   {health} (A=Alive, a=Syncing)")
+                print(f"[*] Sync Progress: {percent:.2f}% ({curr} / {total} sectors)")
+                
+                # 'idle' or 'AA' means the heavy lifting is done
+                if "idle" in parts or health == "AA":
+                    print("[SUCCESS] Status:   FULLY SYNCED")
+                    is_synced = True
+                else:
+                    print("[!] Status:        REBUILDING/SYNCING")
+        except Exception as e:
+            print(f"[!] Error parsing RAID: {e}")
+    else:
+        print(f"[*] RAID Device:   {name} is NOT yet active.")
 
-# 3. Check RAID Sync Progress (from the kernel)
-    try:
-        dm_status = subprocess.check_output(["sudo", "dmsetup", "status", name], text=True).strip()
-        parts = dm_status.split()
-        
-        # Find the part that looks like '83886080/83886080'
-        sync_info = next((p for p in parts if '/' in p), None)
-        
-        if sync_info:
-            curr, total = map(int, sync_info.split('/'))
-            percent = (curr / total) * 100
-            
-            # Health is usually at index 5 (e.g., 'AA')
-            health = parts[5] if len(parts) > 5 else "unknown"
-            
-            print(f"[*] RAID Health: {health} (A=Alive, D=Dead/Down)")
-            print(f"[*] Sync Progress: {percent:.2f}% ({curr} / {total} sectors)")
-            
-            # Check if we are idle vs rebuilding
-            if "idle" in parts:
-                print("[SUCCESS] Status: FULLY SYNCED (Idle)")
-            else:
-                print("[!] Status: REBUILDING/SYNCING")
-    except StopIteration:
-        print("[!] Could not find sync progress in dmsetup output.")
-    except Exception as e:
-        print(f"[!] Error parsing RAID status: {e}")
-
-    # 4. Actionable Advice
     print("-" * 40)
     if is_on_raid:
-        if "percent" in locals() and percent >= 100:
-            print("👉 Recommendation: Run 'las break' to finalize migration.")
-            print("   Or reboot to origin if you want to revert migration.")
+        if 'is_synced' in locals() and is_synced:
+            print("👉 SUCCESS: Migration synced! Run 'las break' to finalize.")
         else:
-            print("👉 Recommendation: Wait for sync to hit 100% or adjust throttle.")
+            print("👉 STATUS: Mirroring in progress. Stay booted into this entry.")
     else:
-        print("👉 Recommendation: Reboot and select the 'LAS' entry to start migration.")
-        print("   Or run 'las revert' to clean up if you've changed your mind.")
+        # Check if the RAID device actually exists even if we aren't booted to it
+        raid_exists = os.path.exists(f"/dev/mapper/{name}")
+        
+        if raid_exists:
+            print("👉 ERROR: You are booted into Origin. RAID is active but NOT in use.")
+            print("   Please reboot and select the 'LAS' boot entry.")
+        else:
+            print("👉 STATUS: No active migration found in the kernel.")
+            print("   Run 'las prepare' to begin a new migration.")
 
 
 def prepare_root(engine, name, origin, dest, meta_orig, meta_dest):
     """
     Main workflow for the Lift and Shift (LAS) root migration.
+    Updated to work with dynamic Boom entry mapping.
     """
     print(f"[*] Starting Lift and Shift (LAS) preparation for: {name}")
 
@@ -167,28 +190,24 @@ def prepare_root(engine, name, origin, dest, meta_orig, meta_dest):
         return False
 
     # 2. Prime Source Metadata (Leg 0)
-    # Writes the binary identity to the metadata disk so the boot hook recognizes it.
     raid.wipe_metadata(meta_orig)
     if not raid.write_dm_raid_superblock(meta_orig, origin_sz):
         print("[!] Failed to prime source metadata.")
         return False
 
     # 3. Resolve Persistent Paths (by-id)
-    # Used in the Dracut hook to ensure we find the right disks after reboot.
     p_orig = utils.get_persistent_path(origin)
     p_dest = utils.get_persistent_path(dest)
     p_m_orig = utils.get_persistent_path(meta_orig)
     p_m_dest = utils.get_persistent_path(meta_dest)
 
     # 4. Inject Assembly Hook & Create Initramfs
-    # Generates the self-assembling /boot/initramfs-las-{name}.img
     img_path = utils.inject_las_assembly_hook(name, p_orig, p_dest, p_m_orig, p_m_dest)
     if not img_path:
         return False
 
-    # 5. Dynamic Filesystem Discovery
-    # We pull the FSTYPE and OPTIONS directly from the live '/' mount.
-    # This prevents hard-coding for Btrfs, XFS, or Ext4.
+    # 5. Dynamic Filesystem Discovery for Root (/)
+    # We still need current_fstype/flags for the database and the root mount.
     try:
         # findmnt -n (no headings) -o (output columns)
         cmd = ["findmnt", "-n", "-o", "FSTYPE,OPTIONS", "/"]
@@ -196,18 +215,13 @@ def prepare_root(engine, name, origin, dest, meta_orig, meta_dest):
         current_fstype = fs_info[0]
         current_fsflags = fs_info[1]
         
-        # Get the partition index (e.g., '3' if root is on /dev/sda3)
-        _, part_idx = utils.get_root_partition_info()
-        
-        print(f"[*] Detected {current_fstype} on partition {part_idx}")
-        print(f"[*] Using mount flags: {current_fsflags}")
+        print(f"[*] Detected {current_fstype} for migration.")
+        print(f"[*] Using root mount flags: {current_fsflags}")
     except Exception as e:
         print(f"[!] Could not detect live filesystem info: {e}")
         return False
 
     # 6. DATABASE UPDATE
-    # We record the state before rebooting so the 'sync' command 
-    # knows which devices belong to this migration.
     print("[*] Updating migration database...")
     database.record_migration(
         name=name,
@@ -219,19 +233,21 @@ def prepare_root(engine, name, origin, dest, meta_orig, meta_dest):
         fstype=current_fstype,
         fsflags=current_fsflags
     )
-    # 6. Register Boot Entry with the Engine
-    # Passing the img_path, fstype, fsflags, and part_index as requested.
-    if not engine.setup_boom_entry(img_path, current_fstype, current_fsflags, part_idx):
+
+    # 7. Register Boot Entry with the Engine
+    # Note: part_idx is no longer passed; setup_boom_entry will detect all mounts.
+    if not engine.setup_boom_entry(img_path, current_fstype, current_fsflags):
         print("[!] Failed to register Boom boot entry.")
         return False
 
     print(f"\n[SUCCESS] Lift and Shift prepared for '{name}'.")
-    print(f"[ACTION] Run: grub2-reboot 'LAS: {name}' && reboot")
+    # Updated the suggestion to match the Boom Title we set in the function
+    print(f"[ACTION] Run: grub2-reboot 'LAS-{name}' && reboot")
     return True
 
 def main():
     parser = argparse.ArgumentParser(
-        description="LAS: Lift and Shift (Logical Adoption System) - Block Migration Tool"
+        description="las: Lift and Shift - Block Migration Tool"
     )
     subparsers = parser.add_subparsers(dest='command', help='Migration commands')
 
