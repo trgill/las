@@ -122,6 +122,7 @@ class RAIDEngine:
             return False
 
         mount_args = []
+
         for line in mount_data:
             parts = line.split(None, 3)
             if len(parts) < 4: continue
@@ -132,19 +133,28 @@ class RAIDEngine:
             # 1. Clean the source path
             source = source.replace(']', '').replace('[', '').strip()
             
-            # 2. Logic for /home on Btrfs
-            if target == "/home" and mnt_fstype == "btrfs":
-                # Ensure the subvolume flag is preserved or explicitly added
+            # Initialize dev_str with a safe default (the current source)
+            dev_str = source
+
+            # 2. Logic for Hybrid Mount Strategy
+            if target == "/boot":
+                # KEEP ON ORIGIN: Use the physical device directly
+                dev_str = source 
+            
+            elif target == "/home" and mnt_fstype == "btrfs":
+                # MOVE TO MAPPER: Use the RAID device and ensure subvol flag
                 if "subvol=" not in mnt_opts:
-                    # If findmnt didn't show it, we force it based on the subvolume list
                     mnt_opts += ",subvol=home"
-                
-                # We MUST use the mapper device for the RAID
                 dev_str = f"/dev/mapper/{clean_name}{separator}{root_idx}"
             
-            # ... (rest of your logic for /boot on origin) ...
+            elif source_disk in source:
+                # GENERAL CASE: If it's on the source disk, move it to the mapper
+                part_match = re.search(r'(\d+)(?:/.*)?$', source)
+                idx = part_match.group(1) if part_match else os.path.basename(source)
+                dev_str = f"/dev/mapper/{clean_name}{separator}{idx}"
 
             # 3. Mask the old unit and add the extra mount
+            # We only generate mount args for devices we actually want to manage
             unit_name = target.strip('/').replace('/', '-')
             mount_args.append(f"systemd.mask={unit_name}.mount")
             
