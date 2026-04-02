@@ -197,6 +197,7 @@ class RAIDEngine:
             'sudo', 'boom', 'entry', 'create', 
             '--title', f'LAS-{clean_name}',
             '--root-device', root_mapper,
+            '--no-fstab',
             '-v', kver,
             '-i', rel_img_path.replace("//", "/"),
             '--add-opts', all_opts,
