@@ -116,52 +116,57 @@ class RAIDEngine:
         # 3. Process Mounts
         migration_opts = "x-systemd.device-timeout=60s,nofail"
         try:
-            mount_data = subprocess.check_output(['findmnt', '-l', '-n', '-o', 'TARGET,SOURCE,FSTYPE,OPTIONS'], text=True).splitlines()
+            mount_data = subprocess.check_output([
+                        'findmnt', '-l', '-n', '--real',
+                        '-o', 'TARGET,SOURCE,FSTYPE,OPTIONS'
+                    ], text=True).splitlines()   
         except Exception as e:
             print(f"[!] Mount scan error: {e}")
             return False
 
+
         mount_args = []
+        boot_dev_display = "Unknown" # For the final print
 
         for line in mount_data:
             parts = line.split(None, 3)
             if len(parts) < 4: continue
             target, source, mnt_fstype, mnt_opts = parts
-            
-            if target == "/": continue 
-            
-            # 1. Clean the source path
+            # Root is handled by the primary 'root=' kernel parameter.
+            # Adding it here via 'mount-extra' causes the generator crash.
+            if target == "/" or target == "/root": 
+                continue
+
             source = source.replace(']', '').replace('[', '').strip()
             
-            # Initialize dev_str with a safe default (the current source)
+            # STICKY RULE: Only process things that look like real devices
+            if not source.startswith('/dev/'): 
+                continue
+
             dev_str = source
 
-            # 2. Logic for Hybrid Mount Strategy
             if target == "/boot":
-                # KEEP ON ORIGIN: Use the physical device directly
-                dev_str = source 
+                dev_str = source # /dev/sda2
+                boot_dev_display = source
             
             elif target == "/home" and mnt_fstype == "btrfs":
-                # MOVE TO MAPPER: Use the RAID device and ensure subvol flag
                 if "subvol=" not in mnt_opts:
                     mnt_opts += ",subvol=home"
                 dev_str = f"/dev/mapper/{clean_name}{separator}{root_idx}"
             
             elif source_disk in source:
-                # GENERAL CASE: If it's on the source disk, move it to the mapper
                 part_match = re.search(r'(\d+)(?:/.*)?$', source)
                 idx = part_match.group(1) if part_match else os.path.basename(source)
                 dev_str = f"/dev/mapper/{clean_name}{separator}{idx}"
 
-            # 3. Mask the old unit and add the extra mount
-            # We only generate mount args for devices we actually want to manage
+            # 3. Create the pair: Mask the old, Add the new
             unit_name = target.strip('/').replace('/', '-')
-            mount_args.append(f"systemd.mask={unit_name}.mount")
-            
-            # Sanitize and add
-            clean_opts = mnt_opts.replace(",seclabel", "").replace("zstd:1", "zstd")
-            final_opts = f"{clean_opts},{migration_opts}"
-            mount_args.append(f"systemd.mount-extra={dev_str}:{target}:{mnt_fstype}:{final_opts}")
+            if unit_name:
+                mount_args.append(f"systemd.mask={unit_name}.mount")
+                
+                clean_opts = mnt_opts.replace(",seclabel", "").replace("zstd:1", "zstd")
+                final_opts = f"{clean_opts.strip(',')},{migration_opts}"
+                mount_args.append(f"systemd.mount-extra={dev_str}:{target}:{mnt_fstype}:{final_opts}")
 
         # 4. Finalize Kernel Options
         kver = subprocess.check_output(['uname', '-r'], text=True).strip()
@@ -177,7 +182,7 @@ class RAIDEngine:
             "SYSTEMD_SULOGIN_FORCE=1 rd.shell loglevel=7"
         ]
 
-        # Combine core args with our mount-extras and masks
+        # Combine core args with our mount-extras and masksk
         all_args_list = core_args + mount_args
 
         # Ensure Console settings are last
