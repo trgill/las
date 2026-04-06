@@ -25,6 +25,23 @@ import subprocess
 import database
 import os
 
+def sync_partition_table(src, dest):
+    print(f"[*] Syncing partition table from {src} to {dest}...")
+    try:
+        # Dump from source and pipe to destination
+        dump = subprocess.check_output(['sfdisk', '-d', src])
+        process = subprocess.Popen(['sfdisk', dest], stdin=subprocess.PIPE)
+        process.communicate(input=dump)
+        
+        # Move backup GPT headers to the end of the disk
+        subprocess.run(['sgdisk', '-e', dest], check=True)
+        # Force kernel to re-scan
+        subprocess.run(['partprobe', dest], check=True)
+    except Exception as e:
+        print(f"[!] Failed to sync geometry: {e}")
+        return False
+    subprocess.run(['udevadm', 'settle'], check=False) # Wait for /dev/sdd3 to appear
+    return True
 
 def revert_migration(name):
     """
@@ -165,8 +182,7 @@ def show_status(name):
         raid_exists = os.path.exists(f"/dev/mapper/{name}")
         
         if raid_exists:
-            print("👉 ERROR: You are booted into Origin. RAID is active but NOT in use.")
-            print("   Please reboot and select the 'LAS' boot entry.")
+            print("   dm-raid active.")
         else:
             print("👉 STATUS: No active migration found in the kernel.")
             print("   Run 'las prepare' to begin a new migration.")
@@ -189,6 +205,10 @@ def prepare_root(engine, name, origin, dest, meta_orig, meta_dest):
         print(f"[!] Could not determine size of {origin}: {e}")
         return False
 
+    if not sync_partition_table(origin, dest):
+        print("[!] Geometry sync failed. Cannot proceed.")
+        return False
+    
     # 2. Prime Source Metadata (Leg 0)
     raid.wipe_metadata(meta_orig)
     if not raid.write_dm_raid_superblock(meta_orig, origin_sz):

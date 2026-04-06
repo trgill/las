@@ -72,10 +72,16 @@ def inject_las_assembly_hook(name, p_orig, p_dest, p_m_orig, p_m_dest, throttle_
     rate = throttle_kibs if throttle_kibs and throttle_kibs > 0 else 51200
     max_rate = rate * 2
     
+    # We added explicit partprobing of the raw disks and 
+    # a final udev trigger to announce the mapper partitions to systemd.
     hook_content = f"""#!/bin/sh
 # LAS Dynamic Assembly Hook (Lift and Shift)
 echo "LAS: Starting hardware discovery..."
 udevadm settle --timeout=30
+
+# Ensure the physical disks are fully parsed before assembly
+partprobe {p_orig} 2>/dev/null
+partprobe {p_dest} 2>/dev/null
 
 i=0
 while [ $i -lt 15 ]; do
@@ -97,10 +103,15 @@ if [ -e "{p_orig}" ]; then
     
     udevadm settle
     if [ -e "/dev/mapper/{name}" ]; then
-        echo "LAS: Scanning for partitions..."
-        # Try full path, fallback to simple command
+        echo "LAS: Scanning for partitions on mapper..."
+        # Force kernel to see the partitions (migration2, migration3, etc)
         /usr/sbin/partprobe "/dev/mapper/{name}" 2>/dev/null || partprobe "/dev/mapper/{name}"
+        
+        # CRITICAL: Announce the new partition nodes to udev/systemd
+        # This fixes the "Timed out waiting for device" errors for /boot and /home
+        udevadm trigger --action=add /dev/mapper/{name}*
         udevadm settle
+        echo "LAS: Mapper hierarchy ready."
     fi
 else
     echo "LAS: CRITICAL ERROR - Source disk not found!"
@@ -117,6 +128,7 @@ fi
         os.chmod(tmp_hook_path, 0o755)
 
         kver = subprocess.check_output(['uname', '-r'], text=True).strip()
+        # Using a consistent naming convention for the img
         migration_img = f"/boot/initramfs-las-{name}.img"
         
         print(f"[*] Generating LAS Initramfs: {migration_img}")
@@ -126,7 +138,7 @@ fi
             'sudo', 'dracut', '--force',
             '--add', 'dm',
             '--add-drivers', 'dm-raid raid1',
-            '--install', 'dmsetup partprobe blockdev',
+            '--install', 'dmsetup partprobe blockdev udevadm', # Added udevadm to ensure it's in the bin
             '--include', tmp_hook_path, f'/usr/lib/dracut/hooks/pre-mount/{hook_filename}',
             migration_img, kver
         ]
@@ -144,7 +156,7 @@ fi
     except subprocess.CalledProcessError as e:
         print(f"[!] Dracut failed: {e.stderr.decode()}")
         return None
-
+    
 def remove_las_assembly_hook(name):
     """
     Removes the LAS hook and rebuilds the Initramfs to a standard state.

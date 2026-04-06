@@ -81,8 +81,8 @@ class RAIDEngine:
     def setup_boom_entry(self, img_path, fstype, fsflags):
         """
         Creates a Boom entry for live migration.
-        Forces /boot to remain on the physical origin device while 
-        moving other partitions to the migration mapper.
+        Consolidates root arguments and ensures mapper devices are 
+        correctly announced for /boot and /home.
         """
         import subprocess
         import os
@@ -101,7 +101,6 @@ class RAIDEngine:
                 return False
             root_idx = root_idx_match.group(1)
 
-            # Detect the physical parent disk (e.g., sda)
             disk_match = re.match(r'/dev/([a-z]+|nvme\d+n\d+)', root_src)
             source_disk = disk_match.group(1) if disk_match else \
                 subprocess.check_output(f"lsblk -no PKNAME {root_src.split('/')[2]} | head -n1", shell=True, text=True).strip()
@@ -117,77 +116,68 @@ class RAIDEngine:
         migration_opts = "x-systemd.device-timeout=60s,nofail"
         try:
             mount_data = subprocess.check_output([
-                        'findmnt', '-l', '-n', '--real',
-                        '-o', 'TARGET,SOURCE,FSTYPE,OPTIONS'
-                    ], text=True).splitlines()   
+                            'findmnt', '-l', '-n', '--real',
+                            '-o', 'TARGET,SOURCE,FSTYPE,OPTIONS'
+                        ], text=True).splitlines()   
         except Exception as e:
             print(f"[!] Mount scan error: {e}")
             return False
 
-
         mount_args = []
-        boot_dev_display = "Unknown" # For the final print
+        boot_dev_display = "Unknown"
 
         for line in mount_data:
             parts = line.split(None, 3)
             if len(parts) < 4: continue
             target, source, mnt_fstype, mnt_opts = parts
-            # Root is handled by the primary 'root=' kernel parameter.
-            # Adding it here via 'mount-extra' causes the generator crash.
+            
+            # SKIP ROOT: Boom handles this via --root-device
             if target == "/" or target == "/root": 
                 continue
 
             source = source.replace(']', '').replace('[', '').strip()
-            
-            # STICKY RULE: Only process things that look like real devices
             if not source.startswith('/dev/'): 
                 continue
 
             dev_str = source
 
             if target == "/boot":
-                dev_str = source # /dev/sda2
-                boot_dev_display = source
-            
-            elif target == "/home" and mnt_fstype == "btrfs":
-                if "subvol=" not in mnt_opts:
-                    mnt_opts += ",subvol=home"
-                dev_str = f"/dev/mapper/{clean_name}{separator}{root_idx}"
-            
-            elif source_disk in source:
-                part_match = re.search(r'(\d+)(?:/.*)?$', source)
-                idx = part_match.group(1) if part_match else os.path.basename(source)
+                part_match = re.search(r'(\d+)', source)
+                idx = part_match.group(1) if part_match else "2"
                 dev_str = f"/dev/mapper/{clean_name}{separator}{idx}"
-
-            # 3. Create the pair: Mask the old, Add the new
-            unit_name = target.strip('/').replace('/', '-')
-            if unit_name:
-                mount_args.append(f"systemd.mask={unit_name}.mount")
+                boot_dev_display = dev_str
+            
+            elif target == "/home":
+                part_match = re.search(r'(\d+)', source)
+                idx = part_match.group(1) if part_match else root_idx
+                dev_str = f"/dev/mapper/{clean_name}{separator}{idx}"
                 
-                clean_opts = mnt_opts.replace(",seclabel", "").replace("zstd:1", "zstd")
-                final_opts = f"{clean_opts.strip(',')},{migration_opts}"
-                mount_args.append(f"systemd.mount-extra={dev_str}:{target}:{mnt_fstype}:{final_opts}")
+                # Update options to include explicit device pointer for Btrfs
+                if "subvol=" not in mnt_opts:
+                    clean_opts = re.sub(r'subvolid=\d+', '', mnt_opts)
+                    mnt_opts = f"{clean_opts.strip(',')},subvol=/home"
+                mnt_opts = f"{mnt_opts},device={dev_str}"
+
+            # Build the mount-extra string (Removed .mask to avoid conflicts)
+            clean_opts = mnt_opts.replace(",seclabel", "").replace("zstd:1", "zstd")
+            final_opts = f"{clean_opts.replace(',,', ',').strip(',')},{migration_opts}"
+            mount_args.append(f"systemd.mount-extra={dev_str}:{target}:{mnt_fstype}:{final_opts}")
 
         # 4. Finalize Kernel Options
         kver = subprocess.check_output(['uname', '-r'], text=True).strip()
         clean_fsflags = fsflags.replace(",seclabel", "").replace("zstd:1", "zstd")
         
-        # Keep rd.fstab=0 to avoid duplicate mount attempts from the on-disk fstab
+        # REMOVED: "root={root_mapper}" from here because boom adds it automatically
         core_args = [
-            f"root={root_mapper} ro",
-            "rd.fstab=0 rd.retry=60 rootdelay=5",
+            "ro rd.fstab=0 rd.retry=60 rootdelay=5",
             "rd.driver.pre=dm-raid rd.timeout=60 rd.dm=1",
             f"rootfstype={fstype if fstype else 'auto'}",
             f"rootflags={clean_fsflags},device={root_mapper}",
             "SYSTEMD_SULOGIN_FORCE=1 rd.shell loglevel=7"
         ]
 
-        # Combine core args with our mount-extras and masksk
         all_args_list = core_args + mount_args
-
-        # Ensure Console settings are last
-        console_args = ["console=tty0", "console=ttyS0,115200"]
-        all_args_list += console_args
+        all_args_list += ["console=tty0", "console=ttyS0,115200"]
 
         all_opts = " ".join(all_args_list)
         rel_img_path = img_path.replace("/boot", "", 1) if img_path.startswith("/boot") else img_path
@@ -196,15 +186,15 @@ class RAIDEngine:
         cmd = [
             'sudo', 'boom', 'entry', 'create', 
             '--title', f'LAS-{clean_name}',
-            '--root-device', root_mapper,
+            '--root-device', root_mapper, # This creates the FIRST root= entry
             '--no-fstab',
             '-v', kver,
             '-i', rel_img_path.replace("//", "/"),
-            '--add-opts', all_opts,
+            '--add-opts', all_opts,       # This now only adds OTHER options
             '--no-dev'
         ]
 
-        print(f"[*] LAS Entry: Root on Mapper, Boot on Physical {source}")
+        print(f"[*] LAS Entry: Root on {root_mapper}, Boot on {boot_dev_display}")
         subprocess.run(cmd, check=True)
         return True
 
