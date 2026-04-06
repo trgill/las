@@ -2,16 +2,9 @@
 #
 # Copyright Red Hat
 #
+# dm.py - Lift and Shift dm interface
+#
 # This file is part of the las project.
-#
-# SPDX-License-Identifier: Apache-2.0
-#!/usr/bin/env python3
-#
-# Copyright Red Hat
-#
-# snapm/_snapm.py - Snapshot Manager global definitions
-#
-# This file is part of the snapm project.
 #
 # SPDX-License-Identifier: Apache-2.0
 """
