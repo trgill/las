@@ -70,53 +70,62 @@ def get_persistent_path(dev_path):
                     return full_link
     return dev_path
 
-def inject_las_assembly_hook(name, p_orig, p_dest, p_m_orig, p_m_dest, throttle_kibs=51200):
-    rate = throttle_kibs if throttle_kibs and throttle_kibs > 0 else 51200
-    max_rate = rate * 2
+def inject_las_assembly_hook(name, p_orig, p_dest, p_m_orig, p_m_dest, throttle_kibs=1024):
+    # REDUCED DEFAULT RATE: 1024 KiB/s (approx 512 KB/s) 
+    # This prevents I/O saturation during the first boot.
+    rate = throttle_kibs if throttle_kibs and throttle_kibs > 0 else 1024
+    max_rate = rate * 10 
     
-    # We added explicit partprobing of the raw disks and 
-    # a final udev trigger to announce the mapper partitions to systemd.
+    # We calculate the offsets for the linear partitions here 
+    # so the shell script doesn't have to do complex math.
     hook_content = f"""#!/bin/sh
-# LAS Dynamic Assembly Hook (Lift and Shift)
+# LAS Dynamic Assembly Hook
 echo "LAS: Starting hardware discovery..."
 udevadm settle --timeout=30
 
-# Ensure the physical disks are fully parsed before assembly
-partprobe {p_orig} 2>/dev/null
-partprobe {p_dest} 2>/dev/null
+# Force kernel to forget physical Btrfs signatures to avoid conflicts
+/usr/sbin/btrfs device scan --forget 2>/dev/null
 
+# Wait for physical source
 i=0
 while [ $i -lt 15 ]; do
     [ -e "{p_orig}" ] && break
-    echo "LAS: Waiting for {p_orig}..."
     sleep 1
     i=$((i+1))
 done
 
 if [ -e "{p_orig}" ]; then
     SIZE=$(blockdev --getsz {p_orig})
-    echo "LAS: Source {p_orig} found. Size: $SIZE sectors."
     
-    # Corrected Parameter Count: 7
+    # 1. Assemble the RAID Mirror
+    # rebuild 1 triggers the sync, but our throttled 'rate' keeps it from hanging the boot.
     TABLE="0 $SIZE raid raid1 7 1024 rebuild 1 min_recovery_rate {rate} max_recovery_rate {max_rate} 2 {p_m_orig} {p_orig} {p_m_dest} {p_dest}"
-    
     echo "LAS: Assembling /dev/mapper/{name}..."
     echo "$TABLE" | dmsetup create {name}
     
     udevadm settle
-    if [ -e "/dev/mapper/{name}" ]; then
-        echo "LAS: Scanning for partitions on mapper..."
-        # Force kernel to see the partitions (migration2, migration3, etc)
-        /usr/sbin/partprobe "/dev/mapper/{name}" 2>/dev/null || partprobe "/dev/mapper/{name}"
-        
-        # CRITICAL: Announce the new partition nodes to udev/systemd
-        # This fixes the "Timed out waiting for device" errors for /boot and /home
-        udevadm trigger --action=add /dev/mapper/{name}*
-        udevadm settle
-        echo "LAS: Mapper hierarchy ready."
-    fi
+    
+    # 2. Manually Map the Partitions
+    # This bypasses partprobe issues by creating explicit linear targets 
+    # that match exactly what your 'las.py' expects.
+    echo "LAS: Creating linear partition mappings..."
+    
+    # migration1: BIOS Boot (Size 2048, Offset 2048)
+    echo "0 2048 linear /dev/mapper/{name} 2048" | dmsetup create {name}1
+    
+    # migration2: /boot (Size 4194304, Offset 4096)
+    echo "0 4194304 linear /dev/mapper/{name} 4096" | dmsetup create {name}2
+    
+    # migration3: / (The rest, starting at 4198400)
+    ROOT_SIZE=$((SIZE - 4198400))
+    echo "0 $ROOT_SIZE linear /dev/mapper/{name} 4198400" | dmsetup create {name}3
+    
+    # 3. Final Announcement
+    udevadm trigger --action=add /dev/mapper/{name}*
+    udevadm settle
+    echo "LAS: Mapper hierarchy ready. Recovery running in background at {rate} KiB/s."
 else
-    echo "LAS: CRITICAL ERROR - Source disk not found!"
+    echo "LAS: ERROR - Source disk {p_orig} not found!"
     exit 1
 fi
 """
@@ -130,33 +139,28 @@ fi
         os.chmod(tmp_hook_path, 0o755)
 
         kver = subprocess.check_output(['uname', '-r'], text=True).strip()
-        # Using a consistent naming convention for the img
         migration_img = f"/boot/initramfs-las-{name}.img"
         
         print(f"[*] Generating LAS Initramfs: {migration_img}")
         
-        # Build command
+        # Build command: Added 'btrfs' to ensure we can run 'device scan --forget'
         cmd = [
             'sudo', 'dracut', '--force',
             '--add', 'dm',
             '--add-drivers', 'dm-raid raid1',
-            '--install', 'dmsetup partprobe blockdev udevadm', # Added udevadm to ensure it's in the bin
+            '--install', 'dmsetup blockdev udevadm btrfs', 
             '--include', tmp_hook_path, f'/usr/lib/dracut/hooks/pre-mount/{hook_filename}',
             migration_img, kver
         ]
         
-        subprocess.run(cmd, check=True, capture_output=True)
+        # Removed capture_output so you can see dracut progress and avoid 'tofu' hangs
+        subprocess.run(cmd, check=True)
         
-        # Ensure bits are on disk
         subprocess.run(['sync'], check=True)
-        
-        if os.path.exists(tmp_hook_path):
-            os.remove(tmp_hook_path)
-            
         return migration_img
 
     except subprocess.CalledProcessError as e:
-        print(f"[!] Dracut failed: {e.stderr.decode()}")
+        print(f"[!] Dracut failed.")
         return None
     
 def remove_las_assembly_hook(name):

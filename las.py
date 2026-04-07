@@ -27,6 +27,40 @@ import subprocess
 import database
 import os
 
+def update_sync_throttle(name, throttle_kibs):
+    """
+    Updates the RAID throttle on a live mapper device by staging 
+    the table before resuming.
+    """
+    try:
+        # 1. Get current table to ensure we preserve device majors/minors
+        current_table = subprocess.check_output(['sudo', 'dmsetup', 'table', name], text=True).strip()
+        
+        # 2. Prepare the new table string
+        # We preserve everything but swap the rate numbers
+        import re
+        new_max = throttle_kibs * 2
+        new_table = re.sub(r'min_recovery_rate \d+', f'min_recovery_rate {throttle_kibs}', current_table)
+        new_table = re.sub(r'max_recovery_rate \d+', f'max_recovery_rate {new_max}', new_table)
+
+        print(f"[*] Staging new throttle: {throttle_kibs} KiB/s...")
+
+        # 3. THE FIX: Load into the INACTIVE slot first
+        # This avoids the 'Invalid Argument' error on a live 'reload'
+        load_proc = subprocess.Popen(['sudo', 'dmsetup', 'load', name], stdin=subprocess.PIPE)
+        load_proc.communicate(input=new_table.encode())
+
+        # 4. Suspend/Resume to flip the slots
+        # Suspend flushes I/O so the superblock can be updated
+        subprocess.run(['sudo', 'dmsetup', 'suspend', name], check=True)
+        subprocess.run(['sudo', 'dmsetup', 'resume', name], check=True)
+
+        print("[SUCCESS] Sync speed updated.")
+    except Exception as e:
+        print(f"[!] Sync update failed. Attempting emergency resume...")
+        subprocess.run(['sudo', 'dmsetup', 'resume', name], stderr=subprocess.DEVNULL)
+
+
 def sync_partition_table(src, dest):
     print(f"[*] Syncing partition table from {src} to {dest}...")
     try:

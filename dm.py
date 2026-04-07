@@ -164,6 +164,8 @@ class RAIDEngine:
         core_args = [
             "ro rd.fstab=0 rd.retry=60 rootdelay=5",
             "rd.driver.pre=dm-raid rd.timeout=60 rd.dm=1",
+            "selinux=0",
+            "3"
             f"rootfstype={fstype if fstype else 'auto'}",
             f"rootflags={clean_fsflags},device={root_mapper}",
             "SYSTEMD_SULOGIN_FORCE=1 rd.shell loglevel=7"
@@ -219,18 +221,43 @@ class RAIDEngine:
         
         return raw, "Checking..."
 
-    def start_sync(self, orig, dest, m_orig, m_dest, throttle=None):
-        """Suspends device and reloads table to start background synchronization."""
-        size = utils.get_block_size(orig)
-        feat = f"2 max_recovery_rate {throttle}" if throttle else "0"
-        table = f"0 {size} raid raid1 {feat} 1024 2 {m_orig} {orig} {m_dest} {dest}"
+    def start_sync(self, name, new_throttle):
+        """
+        Safely updates the throttle on an active migration mapper.
+        Uses the staged 'load' method to avoid 'Invalid Argument' errors.
+        """
+        import subprocess
+        import re
 
-        subprocess.run(["sudo", "dmsetup", "suspend", self.name])
-        p = subprocess.Popen(
-            ["sudo", "dmsetup", "load", self.name], stdin=subprocess.PIPE, text=True
-        )
-        p.communicate(input=table)
-        return subprocess.run(["sudo", "dmsetup", "resume", self.name]).returncode == 0
+        try:
+            # 1. Get the EXACT table currently running in the kernel
+            # This ensures we don't guess the size or device majors/minors
+            current_table = subprocess.check_output(
+                ['sudo', 'dmsetup', 'table', name], text=True
+            ).strip()
+
+            # 2. Update the throttle values in the string
+            # We preserve 'rebuild 1' and all device paths exactly as they are
+            new_max = new_throttle * 2
+            updated_table = re.sub(r'min_recovery_rate \d+', f'min_recovery_rate {new_throttle}', current_table)
+            updated_table = re.sub(r'max_recovery_rate \d+', f'max_recovery_rate {new_max}', updated_table)
+
+            # 3. Stage the table (Load into inactive slot)
+            # Using 'load' instead of 'reload' is much more stable for active RAIDs
+            load_proc = subprocess.Popen(['sudo', 'dmsetup', 'load', name], stdin=subprocess.PIPE)
+            load_proc.communicate(input=updated_table.encode())
+
+            # 4. Atomic Switch
+            # Suspend pauses I/O to allow the superblock/metadata update
+            subprocess.run(['sudo', 'dmsetup', 'suspend', name], check=True)
+            subprocess.run(['sudo', 'dmsetup', 'resume', name], check=True)
+
+            return True
+        except Exception as e:
+            print(f"[!] Engine Sync Error: {e}")
+            # Emergency resume just in case it got stuck in suspended state
+            subprocess.run(['sudo', 'dmsetup', 'resume', name], stderr=subprocess.DEVNULL)
+            return False
 
     def remount_to_mapper(self, orig_dev, hook_script=None):
         """Swaps physical mount for mapper mount live."""
