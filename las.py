@@ -303,7 +303,7 @@ def prepare_root(engine, name, origin, dest, meta_orig, meta_dest):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="las: Lift and Shift - Block Migration Tool"
+        description="las: Lift and Shift - Block Device Migration Tool"
     )
     subparsers = parser.add_subparsers(dest='command', help='Migration commands')
 
@@ -386,7 +386,7 @@ def main():
 
     elif args.command == 'sync':
         rec = database.get_migration(args.name)
-        if rec and engine.start_sync(rec['orig'], rec['dest'], rec['meta_orig'], rec['meta_dest'], args.throttle):
+        if rec and engine.start_sync(args.name, args.throttle):
             database.update_throttle(args.name, args.throttle)
             print(f"[SUCCESS] Sync speed set to {args.throttle or 'default'} KiB/s")
 
