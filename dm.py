@@ -279,6 +279,8 @@ class RAIDEngine:
                 return mount_point
             # Rollback
             subprocess.run(["sudo", "mount", orig_dev, mount_point])
+            utils.run_hook(hook_script, "resume")
+            return None
         else:
             utils.list_blocking_pids(mount_point)
 
