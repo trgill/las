@@ -93,9 +93,6 @@ class RAIDEngine:
                 print(f"[!] Could not find partition index for {root_src}")
                 return False
             root_idx = root_idx_match.group(1)
-
-            disk_match = re.match(r'/dev/([a-z]+|nvme\d+n\d+)', root_src)
-            source_disk = disk_match.group(1) if disk_match else \
                 subprocess.check_output(f"lsblk -no PKNAME {root_src.split('/')[2]} | head -n1", shell=True, text=True).strip()
         except Exception as e:
             print(f"[!] Detection error: {e}")
