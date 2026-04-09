@@ -246,6 +246,9 @@ class RAIDEngine:
             # Using 'load' instead of 'reload' is much more stable for active RAIDs
             load_proc = subprocess.Popen(['sudo', 'dmsetup', 'load', name], stdin=subprocess.PIPE)
             load_proc.communicate(input=updated_table.encode())
+            if load_proc.returncode != 0:
+                print(f"[!] dmsetup load failed with return code {load_proc.returncode}, aborting.")
+                return False
 
             # 4. Atomic Switch
             # Suspend pauses I/O to allow the superblock/metadata update
