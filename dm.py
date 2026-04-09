@@ -28,6 +28,9 @@ class RAIDEngine:
         """
         # 1. Calculate Sectors (Aligned to 1024)
         res = subprocess.run(['blockdev', '--getsz', orig], capture_output=True, text=True)
+        if res.returncode != 0 or not res.stdout.strip():
+            print(f"[!] Failed to get block size for {orig}: {res.stderr.strip()}")
+            return False
         self.sectors = (int(res.stdout.strip()) // 1024) * 1024
 
         print(f"[*] Targeting {self.sectors} sectors (1024 sector alignment)")
