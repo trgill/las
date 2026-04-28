@@ -70,14 +70,66 @@ def get_persistent_path(dev_path):
                     return full_link
     return dev_path
 
-def inject_las_assembly_hook(name, p_orig, p_dest, p_m_orig, p_m_dest, throttle_kibs=1024):
-    # REDUCED DEFAULT RATE: 1024 KiB/s (approx 512 KB/s) 
+def inject_las_assembly_hook(name, p_orig, p_dest, p_m_orig, p_m_dest, partitions=None, throttle_kibs=1024):
+    # REDUCED DEFAULT RATE: 1024 KiB/s (approx 512 KB/s)
     # This prevents I/O saturation during the first boot.
     rate = throttle_kibs if throttle_kibs and throttle_kibs > 0 else 1024
-    max_rate = rate * 10 
-    
-    # We calculate the offsets for the linear partitions here 
-    # so the shell script doesn't have to do complex math.
+    max_rate = rate * 10
+
+    # Helper function to generate dynamic partition mappings
+    def generate_partition_mappings(name, partitions):
+        """Generate dmsetup linear mapping commands for all partitions."""
+        mapping_lines = []
+        for part in partitions:
+            num = part['num']
+            start = part['start']
+            size = part['size']
+
+            # dmsetup create requires: "0 <size> linear <device> <offset>"
+            mapping_lines.append(
+                f'if echo "0 {size} linear /dev/mapper/{name} {start}" | dmsetup create {name}{num}; then\n'
+                f'    MAPPED=$((MAPPED + 1))\n'
+                f'else\n'
+                f'    echo "LAS: Warning - failed to map partition {num}"\n'
+                f'    FAILED=$((FAILED + 1))\n'
+                f'fi'
+            )
+
+        return '\n\n'.join(mapping_lines)
+
+    # Generate partition mappings based on whether we have partition data
+    if partitions:
+        # NEW: Dynamic partition mapping
+        partition_map_commands = generate_partition_mappings(name, partitions)
+        print(f"[*] Using dynamic partition mapping for {len(partitions)} partitions")
+    else:
+        # LEGACY: Hardcoded partition mapping (for backward compatibility)
+        print("[!] Warning: Using legacy hardcoded partition offsets")
+        partition_map_commands = """# migration1: BIOS Boot (Size 2048, Offset 2048)
+if echo "0 2048 linear /dev/mapper/{name} 2048" | dmsetup create {name}1; then
+    MAPPED=$((MAPPED + 1))
+else
+    echo "LAS: Warning - failed to map partition 1"
+    FAILED=$((FAILED + 1))
+fi
+
+# migration2: /boot (Size 4194304, Offset 4096)
+if echo "0 4194304 linear /dev/mapper/{name} 4096" | dmsetup create {name}2; then
+    MAPPED=$((MAPPED + 1))
+else
+    echo "LAS: Warning - failed to map partition 2"
+    FAILED=$((FAILED + 1))
+fi
+
+# migration3: / (The rest, starting at 4198400)
+ROOT_SIZE=$((SIZE - 4198400))
+if echo "0 $ROOT_SIZE linear /dev/mapper/{name} 4198400" | dmsetup create {name}3; then
+    MAPPED=$((MAPPED + 1))
+else
+    echo "LAS: Warning - failed to map partition 3"
+    FAILED=$((FAILED + 1))
+fi"""
+
     hook_content = f"""#!/bin/sh
 # LAS Dynamic Assembly Hook
 # Auto-generated for migration: {name}
@@ -148,30 +200,7 @@ echo "LAS: Creating linear partition mappings..."
 MAPPED=0
 FAILED=0
 
-# migration1: BIOS Boot (Size 2048, Offset 2048)
-if echo "0 2048 linear /dev/mapper/{name} 2048" | dmsetup create {name}1; then
-    MAPPED=$((MAPPED + 1))
-else
-    echo "LAS: Warning - failed to map partition 1"
-    FAILED=$((FAILED + 1))
-fi
-
-# migration2: /boot (Size 4194304, Offset 4096)
-if echo "0 4194304 linear /dev/mapper/{name} 4096" | dmsetup create {name}2; then
-    MAPPED=$((MAPPED + 1))
-else
-    echo "LAS: Warning - failed to map partition 2"
-    FAILED=$((FAILED + 1))
-fi
-
-# migration3: / (The rest, starting at 4198400)
-ROOT_SIZE=$((SIZE - 4198400))
-if echo "0 $ROOT_SIZE linear /dev/mapper/{name} 4198400" | dmsetup create {name}3; then
-    MAPPED=$((MAPPED + 1))
-else
-    echo "LAS: Warning - failed to map partition 3"
-    FAILED=$((FAILED + 1))
-fi
+{partition_map_commands}
 
 echo "LAS: Mapped $MAPPED partitions ($FAILED failed)"
 
