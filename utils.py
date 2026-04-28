@@ -296,3 +296,60 @@ def validate_migration_geometry(source_dev, dest_dev, meta_orig, meta_dest):
 
     print("[OK] Geometry validation passed.")
     return True
+
+def parse_partition_table(device):
+    """
+    Parses partition table from device and returns partition geometry.
+
+    Args:
+        device (str): Block device path (e.g., /dev/sda)
+
+    Returns:
+        List of dicts with partition info, e.g.:
+        [
+            {'num': 1, 'start': 2048, 'size': 1024000, 'type': 'EFI System'},
+            {'num': 2, 'start': 1026048, 'size': 2097152, 'type': 'Linux filesystem'},
+            {'num': 3, 'start': 3123200, 'size': 83886080, 'type': 'Linux filesystem'}
+        ]
+        Returns None on error.
+    """
+    import re
+    import subprocess
+
+    try:
+        # Use sfdisk --dump (same as -d but more explicit)
+        output = subprocess.check_output(
+            ['sfdisk', '--dump', device],
+            text=True,
+            stderr=subprocess.DEVNULL
+        )
+
+        partitions = []
+        for line in output.splitlines():
+            # Match lines like: /dev/sda1 : start=2048, size=1024000, type=C12A7328-...
+            match = re.match(r'^\s*\S+(\d+)\s*:\s*start=\s*(\d+),\s*size=\s*(\d+)', line)
+            if match:
+                part_num = int(match.group(1))
+                start = int(match.group(2))
+                size = int(match.group(3))
+
+                # Extract type if present (optional, for debugging)
+                type_match = re.search(r'type=([^,]+)', line)
+                part_type = type_match.group(1) if type_match else 'unknown'
+
+                partitions.append({
+                    'num': part_num,
+                    'start': start,
+                    'size': size,
+                    'type': part_type
+                })
+
+        if not partitions:
+            print(f"[!] Warning: No partitions detected on {device}")
+            return None
+
+        return partitions
+
+    except Exception as e:
+        print(f"[!] Failed to parse partition table from {device}: {e}")
+        return None
