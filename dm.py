@@ -10,7 +10,7 @@
 """
 migration interactions.
 """
-
+import os
 import subprocess
 import re
 import time
@@ -22,7 +22,7 @@ from boom.bootloader import (
     BootEntry,
     BootParams,
     find_entries,
-    delete_entries,
+    drop_entries,
 )
 from boom.osprofile import find_profiles
 
@@ -187,44 +187,55 @@ class RAIDEngine:
         rel_img_path = img_path.replace("/boot", "", 1) if img_path.startswith("/boot") else img_path
         rel_img_path = rel_img_path.replace("//", "/")
 
-        # 5. Create Boom Entry via Python API
+        # 5. Create Boom Entry via CLI (subprocess)
         print(f"[*] LAS Entry: Root on {root_mapper}, Boot on {boot_dev_display}")
 
+        # Universal path resolution for BIOS/UEFI compatibility
+        # Check if /boot is a separate partition (standard on UEFI/XFS installs)
+        is_boot_separate = os.path.ismount('/boot')
+
+        if is_boot_separate:
+            # If /boot is a separate partition, GRUB treats its root as '/'
+            # We strip '/boot' from the start: /boot/initrd.img -> /initrd.img
+            final_img_path = img_path.replace("/boot", "", 1) if img_path.startswith("/boot") else img_path
+            final_kern_path = f"/vmlinuz-{kver}"
+        else:
+            # If /boot is just a folder on '/', we need the full absolute path
+            final_img_path = img_path
+            final_kern_path = f"/boot/vmlinuz-{kver}"
+
+        # Clean up any potential double slashes (e.g. //initramfs)
+        final_img_path = final_img_path.replace("//", "/")
+        final_kern_path = final_kern_path.replace("//", "/")
+
         try:
-            boom.set_boot_path("/boot")
+            # We add --boot-dir to force boom to write to the physical mount
+            # We add --no-dev because /dev/mapper/migration1 isn't active yet
+            boom_cmd = [
+                "boom", "create",
+                "--title", f"LAS-{clean_name}",
+                "--root-device", root_mapper,
+                "--boot-dir", "/boot",   # <--- THE CRITICAL ADDITION
+                "-i", final_img_path, 
+                "-l", final_kern_path,
+                "--options", all_opts,
+                "--no-dev"
+            ]
 
-            profiles = find_profiles()
-            if not profiles:
-                print("[!] No boom OS profiles found.")
+            result = subprocess.run(boom_cmd, capture_output=True, text=True)
+            
+            if result.returncode == 0:
+                print(f"[SUCCESS] Boom entry 'LAS-{clean_name}' created.")
+                return True
+            else:
+                # This will tell us WHY it's failing to write the file
+                print(f"[!] Boom CLI error: {result.stderr.strip()}")
                 return False
-            osp = profiles[0]
-
-            bp = BootParams(
-                version=kver,
-                root_device=root_mapper,
-                initramfs_path=None,
-            )
-
-            entry = BootEntry(
-                title=f"LAS-{clean_name}",
-                boot_params=bp,
-                osprofile=osp,
-            )
-
-            existing = entry.options or ""
-            entry.options = f"{existing} {all_opts}".strip()
-
-            if rel_img_path:
-                entry.linux = rel_img_path
-
-            entry.write_entry()
-
-            print(f"[SUCCESS] Boom entry 'LAS-{clean_name}' created via Python API.")
-            return True
 
         except Exception as e:
-            print(f"[!] Boom Python API error: {e}")
+            print(f"[!] Failed to invoke Boom CLI: {e}")
             return False
+
 
     def activate_passive(self, orig, dest, m_orig, m_dest):
         """Creates a RAID1 target in 'nosync' mode for safe LUN adoption."""
@@ -315,28 +326,28 @@ class RAIDEngine:
         return None
 
     def cleanup_boom_entry(self):
-        """Removes the BLS boot entry created for the migration using the boom Python API."""
-        title_to_delete = f"LAS-{self.name}"
-        print(f"[*] Cleaning up Boom boot entry for '{self.name}'...")
+        clean_name = self.name.strip().replace(']', '').replace('[', '')
+        # Clean up Boom boot entry for 'migration'
+        print(f"[*] Cleaning up Boom boot entry for '{clean_name}'...")
+        
+        # Try 'delete' first since that's what your current VM uses
+        # then fallback to 'drop' for older environments
+        success = False
+        for cmd_verb in ["delete", "drop"]:
+            try:
+                # We target by title and pipe "y" to handle confirmation prompts
+                drop_cmd = ["boom", cmd_verb, "--title", f"LAS-{clean_name}"]
+                result = subprocess.run(drop_cmd, input="y\n", capture_output=True, text=True)
+                
+                if result.returncode == 0:
+                    print(f"[SUCCESS] Boom entry removed via '{cmd_verb}'.")
+                    success = True
+                    break
+            except Exception:
+                continue
 
-        try:
-            boom.set_boot_path("/boot")
-
-            matching = find_entries(title=title_to_delete)
-
-            if not matching:
-                print(f"[*] Note: No Boom entry found for '{title_to_delete}'.")
-                return True
-
-            for entry in matching:
-                delete_entries(boot_id=entry.boot_id)
-
-            print(f"[SUCCESS] Boot entry '{title_to_delete}' removed.")
-            return True
-
-        except Exception as e:
-            print(f"[!] Unexpected error during Boom cleanup: {e}")
-            return False
+        if not success:
+            print(f"[!] Could not find or remove Boom entry 'LAS-{clean_name}'.")
 
     def stop(self):
         """Removes the device mapper device."""
