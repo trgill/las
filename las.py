@@ -244,8 +244,25 @@ def prepare_root(engine, name, origin, dest, meta_orig, meta_dest):
     if not sync_partition_table(origin, dest):
         print("[!] Geometry sync failed. Cannot proceed.")
         return False
-    
-    # 2. Prime Source Metadata (Leg 0)
+
+    # 2. Parse partition table for dynamic hook generation
+    partitions = utils.parse_partition_table(origin)
+    if not partitions:
+        print("[!] Failed to parse partition table. Cannot proceed.")
+        return False
+
+    # Validate we have at least 2 partitions (typically boot + root minimum)
+    if len(partitions) < 2:
+        print(f"[!] Expected at least 2 partitions, found {len(partitions)}")
+        return False
+
+    print(f"[*] Detected {len(partitions)} partitions:")
+    for part in partitions:
+        # Display partition info with size in GB for readability
+        size_gb = (part['size'] * 512) / (1024**3)  # sectors to GB
+        print(f"    Partition {part['num']}: start={part['start']}, size={part['size']} sectors ({size_gb:.2f} GB)")
+
+    # 3. Prime Source Metadata (Leg 0)
     raid.wipe_metadata(meta_orig)
     if not raid.write_dm_raid_superblock(meta_orig, origin_sz):
         print("[!] Failed to prime source metadata.")
@@ -258,7 +275,7 @@ def prepare_root(engine, name, origin, dest, meta_orig, meta_dest):
     p_m_dest = utils.get_persistent_path(meta_dest)
 
     # 4. Inject Assembly Hook & Create Initramfs
-    img_path = utils.inject_las_assembly_hook(name, p_orig, p_dest, p_m_orig, p_m_dest)
+    img_path = utils.inject_las_assembly_hook(name, p_orig, p_dest, p_m_orig, p_m_dest, partitions)
     if not img_path:
         return False
 
