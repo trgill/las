@@ -103,6 +103,19 @@ fi
 
 echo "LAS: Source device {p_orig} ready"
 
+# Prevent partition scanner conflicts
+echo "LAS: Hiding physical partitions..."
+partx -d {p_orig} 2>/dev/null || echo "LAS: partx not available, skipping partition hide"
+
+# Clean up any stale mapper devices
+if dmsetup info {name} >/dev/null 2>&1; then
+    echo "LAS: Removing stale {name}..."
+    dmsetup remove {name} 2>/dev/null || true
+fi
+
+# Flush buffers
+blockdev --flushbufs {p_orig} 2>/dev/null || true
+
 # Get disk size
 SIZE=$(blockdev --getsz {p_orig})
 echo "LAS: Disk size: $SIZE sectors"
@@ -187,12 +200,12 @@ echo "LAS: RAID device: /dev/mapper/{name} with $MAPPED partition(s)"
         
         print(f"[*] Generating LAS Initramfs: {migration_img}")
         
-        # Build command: Added 'btrfs' to ensure we can run 'device scan --forget'
+        # Build command: Install tools needed for device conflict prevention
         cmd = [
             'sudo', 'dracut', '--force',
             '--add', 'dm',
             '--add-drivers', 'dm-raid raid1',
-            '--install', 'dmsetup blockdev udevadm btrfs', 
+            '--install', 'dmsetup blockdev udevadm btrfs partx',
             '--include', tmp_hook_path, f'/usr/lib/dracut/hooks/pre-mount/{hook_filename}',
             migration_img, kver
         ]
