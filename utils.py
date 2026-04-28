@@ -80,11 +80,13 @@ def inject_las_assembly_hook(name, p_orig, p_dest, p_m_orig, p_m_dest, throttle_
     # so the shell script doesn't have to do complex math.
     hook_content = f"""#!/bin/sh
 # LAS Dynamic Assembly Hook
+# Auto-generated for migration: {name}
+
 echo "LAS: Starting hardware discovery..."
 udevadm settle --timeout=30
 
 # Force kernel to forget physical Btrfs signatures to avoid conflicts
-/usr/sbin/btrfs device scan --forget 2>/dev/null
+/usr/sbin/btrfs device scan --forget 2>/dev/null || true
 
 # Wait for physical source
 i=0
@@ -94,40 +96,82 @@ while [ $i -lt 15 ]; do
     i=$((i+1))
 done
 
-if [ -e "{p_orig}" ]; then
-    SIZE=$(blockdev --getsz {p_orig})
-    
-    # 1. Assemble the RAID Mirror
-    # rebuild 1 triggers the sync, but our throttled 'rate' keeps it from hanging the boot.
-    TABLE="0 $SIZE raid raid1 7 1024 rebuild 1 min_recovery_rate {rate} max_recovery_rate {max_rate} 2 {p_m_orig} {p_orig} {p_m_dest} {p_dest}"
-    echo "LAS: Assembling /dev/mapper/{name}..."
-    echo "$TABLE" | dmsetup create {name}
-    
-    udevadm settle
-    
-    # 2. Manually Map the Partitions
-    # This bypasses partprobe issues by creating explicit linear targets 
-    # that match exactly what your 'las.py' expects.
-    echo "LAS: Creating linear partition mappings..."
-    
-    # migration1: BIOS Boot (Size 2048, Offset 2048)
-    echo "0 2048 linear /dev/mapper/{name} 2048" | dmsetup create {name}1
-    
-    # migration2: /boot (Size 4194304, Offset 4096)
-    echo "0 4194304 linear /dev/mapper/{name} 4096" | dmsetup create {name}2
-    
-    # migration3: / (The rest, starting at 4198400)
-    ROOT_SIZE=$((SIZE - 4198400))
-    echo "0 $ROOT_SIZE linear /dev/mapper/{name} 4198400" | dmsetup create {name}3
-    
-    # 3. Final Announcement
-    udevadm trigger --action=add /dev/mapper/{name}*
-    udevadm settle
-    echo "LAS: Mapper hierarchy ready. Recovery running in background at {rate} KiB/s."
-else
+if [ ! -e "{p_orig}" ]; then
     echo "LAS: ERROR - Source disk {p_orig} not found!"
     exit 1
 fi
+
+echo "LAS: Source device {p_orig} ready"
+
+# Get disk size
+SIZE=$(blockdev --getsz {p_orig})
+echo "LAS: Disk size: $SIZE sectors"
+
+# 1. Assemble the RAID Mirror
+# rebuild 1 triggers the sync, but our throttled 'rate' keeps it from hanging the boot.
+TABLE="0 $SIZE raid raid1 7 1024 rebuild 1 min_recovery_rate {rate} max_recovery_rate {max_rate} 2 {p_m_orig} {p_orig} {p_m_dest} {p_dest}"
+echo "LAS: Assembling /dev/mapper/{name}..."
+if ! echo "$TABLE" | dmsetup create {name}; then
+    echo "LAS: ERROR - Failed to create RAID mirror"
+    echo "LAS: Diagnostic information:"
+    dmsetup ls || true
+    lsblk -o NAME,MAJ:MIN,SIZE,TYPE,MOUNTPOINT || true
+    exit 1
+fi
+
+# Verify RAID device appeared
+if [ ! -e "/dev/mapper/{name}" ]; then
+    echo "LAS: ERROR - RAID device did not appear"
+    exit 1
+fi
+
+udevadm settle --timeout=10
+
+# 2. Manually Map the Partitions
+# This bypasses partprobe issues by creating explicit linear targets
+# that match exactly what your 'las.py' expects.
+echo "LAS: Creating linear partition mappings..."
+
+MAPPED=0
+FAILED=0
+
+# migration1: BIOS Boot (Size 2048, Offset 2048)
+if echo "0 2048 linear /dev/mapper/{name} 2048" | dmsetup create {name}1; then
+    MAPPED=$((MAPPED + 1))
+else
+    echo "LAS: Warning - failed to map partition 1"
+    FAILED=$((FAILED + 1))
+fi
+
+# migration2: /boot (Size 4194304, Offset 4096)
+if echo "0 4194304 linear /dev/mapper/{name} 4096" | dmsetup create {name}2; then
+    MAPPED=$((MAPPED + 1))
+else
+    echo "LAS: Warning - failed to map partition 2"
+    FAILED=$((FAILED + 1))
+fi
+
+# migration3: / (The rest, starting at 4198400)
+ROOT_SIZE=$((SIZE - 4198400))
+if echo "0 $ROOT_SIZE linear /dev/mapper/{name} 4198400" | dmsetup create {name}3; then
+    MAPPED=$((MAPPED + 1))
+else
+    echo "LAS: Warning - failed to map partition 3"
+    FAILED=$((FAILED + 1))
+fi
+
+echo "LAS: Mapped $MAPPED partitions ($FAILED failed)"
+
+if [ $MAPPED -eq 0 ]; then
+    echo "LAS: ERROR - No partitions were mapped successfully"
+    exit 1
+fi
+
+# 3. Final Announcement
+udevadm trigger --action=add /dev/mapper/{name}* || true
+udevadm settle --timeout=10
+echo "LAS: Mapper hierarchy ready. Recovery running in background at {rate} KiB/s."
+echo "LAS: RAID device: /dev/mapper/{name} with $MAPPED partition(s)"
 """
 
     hook_filename = f"99-las-assemble-{name}.sh"
