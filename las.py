@@ -369,6 +369,10 @@ def main():
     rvt = subparsers.add_parser('revert', help='Revert to origin and cleanup migration metadata')
     rvt.add_argument('--name', required=True, help='Name of the migration to revert')
 
+    # --- 7. Command: dump-metadata ---
+    dump = subparsers.add_parser('dump-metadata', help='Display RAID metadata for debugging')
+    dump.add_argument('device', help='Metadata device path (e.g., /dev/sdb)')
+
     # Parse arguments after ALL subparsers are added
     args = parser.parse_args()
 
@@ -390,6 +394,13 @@ def main():
 
     elif args.command == 'revert':
         revert_migration(args.name)
+
+    elif args.command == 'dump-metadata':
+        # Display RAID metadata from specified device
+        if not raid.dump_raid_metadata(args.device):
+            print(f"[!] Failed to read metadata from {args.device}")
+            sys.exit(1)
+
     # --- LOGIC: prepare-root ---
     # This command prepares a system for a "Pivot-on-Reboot" migration.
     elif args.command == 'prepare-root':
