@@ -265,8 +265,11 @@ class RAIDEngine:
 
     def start_sync(self, name, new_throttle):
         """
-        Safely updates the throttle on an active migration mapper.
-        Uses dmsetup message to update live without suspending I/O.
+        Updates the throttle on an active migration mapper.
+
+        IMPORTANT: Throttle adjustment requires suspending the dm device, which
+        will cause a kernel panic if the system is booted from it. This function
+        detects if you're running from the RAID and refuses to proceed.
 
         Args:
             name (str): Migration name
@@ -276,45 +279,69 @@ class RAIDEngine:
             tuple: (success: bool, actual_throttle: int or None)
         """
         try:
-            # 1. If no throttle specified, use a fast default to "unleash" sync
+            # 1. Check if system is booted from this RAID device
+            try:
+                root_dev = subprocess.check_output(
+                    ['findmnt', '-n', '-o', 'SOURCE', '/'],
+                    text=True
+                ).strip().split('[')[0]  # Strip Btrfs subvolume notation
+
+                if '/dev/mapper/' in root_dev and name in root_dev:
+                    print(f"\n[!] ERROR: Cannot adjust throttle while booted from RAID")
+                    print(f"[!] Current root: {root_dev}")
+                    print(f"[!] ")
+                    print(f"[!] Reason: Throttle adjustment requires suspending the device,")
+                    print(f"[!]         which would freeze your running root filesystem and")
+                    print(f"[!]         cause a kernel panic.")
+                    print(f"[!] ")
+                    print(f"[!] The RAID will continue syncing at its current throttle rate.")
+                    print(f"[!] Check progress with: ./las.py status --name {name}")
+                    print(f"[!] ")
+                    print(f"[!] To adjust throttle, you must:")
+                    print(f"[!]   1. Reboot into the original disk (not the RAID)")
+                    print(f"[!]   2. Then run: ./las.py sync --name {name} --throttle <rate>")
+                    return False, None
+            except:
+                # If we can't determine, err on the side of caution
+                print("[!] WARNING: Could not determine boot device, refusing throttle change")
+                return False, None
+
+            # 2. If no throttle specified, use a fast default to "unleash" sync
             if new_throttle is None:
                 new_throttle = 500000  # 500 MB/s - fast unrestricted sync
                 print(f"[*] No throttle specified, using fast default: {new_throttle} KiB/s")
 
             new_max = new_throttle * 2
 
-            # 2. Use dmsetup message to update throttle LIVE (no suspend!)
-            # This is safe to use on a running system, even if booted from the RAID
-            print(f"[*] Updating throttle via live message (no suspend)...")
+            # 3. Get current table
+            current_table = subprocess.check_output(
+                ['sudo', 'dmsetup', 'table', name], text=True
+            ).strip()
 
-            # Send min_recovery_rate message
-            result_min = subprocess.run(
-                ['sudo', 'dmsetup', 'message', name, '0', f'min_recovery_rate {new_throttle}'],
-                capture_output=True,
-                text=True
-            )
+            # 4. Update throttle in table
+            updated_table = re.sub(r'min_recovery_rate \d+', f'min_recovery_rate {new_throttle}', current_table)
+            updated_table = re.sub(r'max_recovery_rate \d+', f'max_recovery_rate {new_max}', updated_table)
 
-            # Send max_recovery_rate message
-            result_max = subprocess.run(
-                ['sudo', 'dmsetup', 'message', name, '0', f'max_recovery_rate {new_max}'],
-                capture_output=True,
-                text=True
-            )
+            # 5. DANGER ZONE: This will suspend the device
+            # We only reach here if NOT booted from RAID
+            print(f"[*] Updating throttle (requires brief device suspension)...")
 
-            # Check if both succeeded
-            if result_min.returncode != 0:
-                print(f"[!] Failed to set min_recovery_rate: {result_min.stderr}")
+            load_proc = subprocess.Popen(['sudo', 'dmsetup', 'load', name], stdin=subprocess.PIPE)
+            load_proc.communicate(input=updated_table.encode())
+            if load_proc.returncode != 0:
+                print(f"[!] dmsetup load failed with return code {load_proc.returncode}")
                 return False, None
 
-            if result_max.returncode != 0:
-                print(f"[!] Failed to set max_recovery_rate: {result_max.stderr}")
-                return False, None
+            subprocess.run(['sudo', 'dmsetup', 'suspend', name], check=True)
+            subprocess.run(['sudo', 'dmsetup', 'resume', name], check=True)
 
-            print(f"[SUCCESS] Throttle updated live: min={new_throttle}, max={new_max} KiB/s")
+            print(f"[SUCCESS] Throttle updated: min={new_throttle}, max={new_max} KiB/s")
             return True, new_throttle
 
         except Exception as e:
             print(f"[!] Engine Sync Error: {e}")
+            # Emergency resume
+            subprocess.run(['sudo', 'dmsetup', 'resume', name], stderr=subprocess.DEVNULL)
             return False, None
 
     def remount_to_mapper(self, orig_dev, hook_script=None):
