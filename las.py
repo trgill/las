@@ -431,9 +431,11 @@ def main():
 
     elif args.command == 'sync':
         rec = database.get_migration(args.name)
-        if rec and engine.start_sync(args.name, args.throttle):
-            database.update_throttle(args.name, args.throttle)
-            print(f"[SUCCESS] Sync speed set to {args.throttle or 'default'} KiB/s")
+        if rec:
+            success, actual_throttle = engine.start_sync(args.name, args.throttle)
+            if success and actual_throttle:
+                database.update_throttle(args.name, actual_throttle)
+                print(f"[SUCCESS] Sync speed set to {actual_throttle} KiB/s")
 
     elif args.command == 'break':
         rec = database.get_migration(args.name)

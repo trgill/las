@@ -267,6 +267,13 @@ class RAIDEngine:
         """
         Safely updates the throttle on an active migration mapper.
         Uses the staged 'load' method to avoid 'Invalid Argument' errors.
+
+        Args:
+            name (str): Migration name
+            new_throttle (int or None): New throttle in KiB/s, or None to use fast default
+
+        Returns:
+            tuple: (success: bool, actual_throttle: int or None)
         """
         try:
             # 1. Get the EXACT table currently running in the kernel
@@ -274,29 +281,34 @@ class RAIDEngine:
                 ['sudo', 'dmsetup', 'table', name], text=True
             ).strip()
 
-            # 2. Update the throttle values in the string
+            # 2. If no throttle specified, use a fast default to "unleash" sync
+            if new_throttle is None:
+                new_throttle = 500000  # 500 MB/s - fast unrestricted sync
+                print(f"[*] No throttle specified, using fast default: {new_throttle} KiB/s")
+
+            # 3. Update the throttle values in the string
             new_max = new_throttle * 2
             updated_table = re.sub(r'min_recovery_rate \d+', f'min_recovery_rate {new_throttle}', current_table)
             updated_table = re.sub(r'max_recovery_rate \d+', f'max_recovery_rate {new_max}', updated_table)
 
-            # 3. Stage the table (Load into inactive slot)
+            # 4. Stage the table (Load into inactive slot)
             load_proc = subprocess.Popen(['sudo', 'dmsetup', 'load', name], stdin=subprocess.PIPE)
             load_proc.communicate(input=updated_table.encode())
             if load_proc.returncode != 0:
                 print(f"[!] dmsetup load failed with return code {load_proc.returncode}, aborting.")
-                return False
+                return False, None
 
-            # 4. Atomic Switch
+            # 5. Atomic Switch
             subprocess.run(['sudo', 'dmsetup', 'suspend', name], check=True)
             subprocess.run(['sudo', 'dmsetup', 'resume', name], check=True)
 
-            return True
+            return True, new_throttle
 
         except Exception as e:
             print(f"[!] Engine Sync Error: {e}")
             # Emergency resume just in case it got stuck in suspended state
             subprocess.run(['sudo', 'dmsetup', 'resume', name], stderr=subprocess.DEVNULL)
-            return False
+            return False, None
 
     def remount_to_mapper(self, orig_dev, hook_script=None):
         """Swaps physical mount for mapper mount live."""
