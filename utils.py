@@ -70,10 +70,10 @@ def get_persistent_path(dev_path):
                     return full_link
     return dev_path
 
-def inject_las_assembly_hook(name, p_orig, p_dest, p_m_orig, p_m_dest, partitions=None, throttle_kibs=1024):
-    # REDUCED DEFAULT RATE: 1024 KiB/s (approx 512 KB/s)
-    # This prevents I/O saturation during the first boot.
-    rate = throttle_kibs if throttle_kibs and throttle_kibs > 0 else 1024
+def inject_las_assembly_hook(name, p_orig, p_dest, p_m_orig, p_m_dest, partitions=None, throttle_kibs=3072):
+    # DEFAULT RATE: 3072 KiB/s (~3 MB/s)
+    # This balances boot responsiveness with reasonable sync speed.
+    rate = throttle_kibs if throttle_kibs and throttle_kibs > 0 else 3072
     max_rate = rate * 10
 
     # Helper function to generate dynamic partition mappings
