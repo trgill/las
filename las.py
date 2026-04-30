@@ -142,24 +142,25 @@ def list_migrations():
 def check_boot_state(name):
     import subprocess
     import re
-    
+
     root_dev = "Unknown"
     is_on_raid = False
-    
+
     try:
         # Get the source for /
         root_dev_raw = subprocess.check_output(["findmnt", "-n", "-o", "SOURCE", "/"], text=True).strip()
-        
+
         # Strip Btrfs subvolume notation: /dev/sda3[/root] -> /dev/sda3
-        root_dev = re.sub(r'[\[/].*$', '', root_dev_raw)
-        
+        # Use simple string replacement instead of problematic regex
+        root_dev = root_dev_raw.split('[')[0]  # Remove [/root] suffix if present
+
         # Check for mapper and name match
         if "/dev/mapper/" in root_dev and name in root_dev:
             is_on_raid = True
-            
+
     except Exception as e:
         root_dev = f"Error: {str(e)}"
-        
+
     return is_on_raid, root_dev
 
 def show_status(name):
