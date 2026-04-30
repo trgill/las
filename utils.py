@@ -423,16 +423,125 @@ def regenerate_filesystem_uuid(device, fstype):
         return False
 
 
+def check_migration_readiness(source_dev, dest_dev, meta_orig, meta_dest, verbose=True):
+    """
+    Comprehensive pre-flight check for migration readiness.
+
+    Args:
+        source_dev (str): Source data partition
+        dest_dev (str): Destination data partition
+        meta_orig (str): Source metadata device
+        meta_dest (str): Destination metadata device
+        verbose (bool): Print detailed information
+
+    Returns:
+        bool: True if all checks pass, False otherwise
+    """
+    # Minimum sizes in sectors
+    MIN_META_SECTORS = 2048  # 1 MB minimum for RAID metadata
+
+    if verbose:
+        print("\n" + "="*60)
+        print("LAS Migration Pre-Flight Check")
+        print("="*60)
+
+    try:
+        # Get all device sizes
+        src_sectors = get_block_size(source_dev)
+        dest_sectors = get_block_size(dest_dev)
+        meta_orig_sectors = get_block_size(meta_orig)
+        meta_dest_sectors = get_block_size(meta_dest)
+
+        # Convert to human-readable sizes
+        def sectors_to_gb(sectors):
+            return (sectors * 512) / (1024**3)
+
+        if verbose:
+            print(f"\n[*] Device Size Report:")
+            print(f"    Source Data:      {source_dev}")
+            print(f"      Size:           {src_sectors:,} sectors ({sectors_to_gb(src_sectors):.2f} GB)")
+            print(f"\n    Destination Data: {dest_dev}")
+            print(f"      Size:           {dest_sectors:,} sectors ({sectors_to_gb(dest_sectors):.2f} GB)")
+
+            if dest_sectors >= src_sectors:
+                extra = dest_sectors - src_sectors
+                print(f"      Surplus:        {extra:,} sectors ({sectors_to_gb(extra):.2f} GB) ✓")
+            else:
+                shortage = src_sectors - dest_sectors
+                print(f"      SHORTAGE:       {shortage:,} sectors ({sectors_to_gb(shortage):.2f} GB) ✗")
+
+            print(f"\n    Source Metadata:  {meta_orig}")
+            print(f"      Size:           {meta_orig_sectors:,} sectors ({sectors_to_gb(meta_orig_sectors):.2f} GB)")
+            print(f"      Required:       {MIN_META_SECTORS:,} sectors ({sectors_to_gb(MIN_META_SECTORS):.2f} GB)")
+
+            if meta_orig_sectors >= MIN_META_SECTORS:
+                print(f"      Status:         ✓ OK")
+            else:
+                print(f"      Status:         ✗ TOO SMALL")
+
+            print(f"\n    Dest Metadata:    {meta_dest}")
+            print(f"      Size:           {meta_dest_sectors:,} sectors ({sectors_to_gb(meta_dest_sectors):.2f} GB)")
+            print(f"      Required:       {MIN_META_SECTORS:,} sectors ({sectors_to_gb(MIN_META_SECTORS):.2f} GB)")
+
+            if meta_dest_sectors >= MIN_META_SECTORS:
+                print(f"      Status:         ✓ OK")
+            else:
+                print(f"      Status:         ✗ TOO SMALL")
+
+        # Validation checks
+        checks_passed = True
+        errors = []
+
+        # Check 1: Destination must be >= source size
+        if dest_sectors < src_sectors:
+            shortage = src_sectors - dest_sectors
+            errors.append(f"Destination is {shortage:,} sectors ({sectors_to_gb(shortage):.2f} GB) too small")
+            checks_passed = False
+
+        # Check 2: Metadata devices must meet minimum size
+        if meta_orig_sectors < MIN_META_SECTORS:
+            shortage = MIN_META_SECTORS - meta_orig_sectors
+            errors.append(f"Source metadata device is {shortage:,} sectors too small (minimum {MIN_META_SECTORS:,})")
+            checks_passed = False
+
+        if meta_dest_sectors < MIN_META_SECTORS:
+            shortage = MIN_META_SECTORS - meta_dest_sectors
+            errors.append(f"Destination metadata device is {shortage:,} sectors too small (minimum {MIN_META_SECTORS:,})")
+            checks_passed = False
+
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"[*] Validation Results:")
+            print(f"{'='*60}")
+
+            if checks_passed:
+                print(f"✓ All checks passed - migration is ready to proceed")
+            else:
+                print(f"✗ {len(errors)} error(s) found:")
+                for i, err in enumerate(errors, 1):
+                    print(f"  {i}. {err}")
+
+            print(f"{'='*60}\n")
+
+        return checks_passed
+
+    except Exception as e:
+        if verbose:
+            print(f"\n[!] Error during pre-flight check: {e}")
+        return False
+
+
 def validate_migration_geometry(source_dev, dest_dev, meta_orig, meta_dest):
     """
     Checks all involved disks to ensure the migration will physically fit.
+    (Legacy function - kept for backward compatibility)
     """
     print(f"[*] Validating disk geometry for RAID assembly...")
 
     # Get sector counts using your existing function
     src_sectors = get_block_size(source_dev)
     dest_sectors = get_block_size(dest_dev)
-    
+
     # Metadata devices also need a minimum size (usually ~4096 sectors for RAID1 metadata)
     meta_orig_sectors = get_block_size(meta_orig)
     meta_dest_sectors = get_block_size(meta_dest)

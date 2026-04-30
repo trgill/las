@@ -362,16 +362,21 @@ def main():
     # --- 5. Command: list ---
     subparsers.add_parser('list', help='List migrations in database')
 
-    # --- 6. Command: break ---
+    # --- 6. Command: check ---
+    chk = subparsers.add_parser('check', help='Validate migration readiness without making changes')
+    add_common_args(chk)
+
+    # --- 7. Command: break ---
     brk = subparsers.add_parser('break', help='Finalize and remove mirror')
     brk.add_argument('--name', default='migration')
     brk.add_argument('--commit', action='store_true',
                      help='Regenerate UUID on origin disk to prevent conflicts')
 
+    # --- 8. Command: revert ---
     rvt = subparsers.add_parser('revert', help='Revert to origin and cleanup migration metadata')
     rvt.add_argument('--name', required=True, help='Name of the migration to revert')
 
-    # --- 7. Command: dump-metadata ---
+    # --- 9. Command: dump-metadata ---
     dump = subparsers.add_parser('dump-metadata', help='Display RAID metadata for debugging')
     dump.add_argument('device', help='Metadata device path (e.g., /dev/sdb)')
 
@@ -401,6 +406,15 @@ def main():
         # Display RAID metadata from specified device
         if not raid.dump_raid_metadata(args.device):
             print(f"[!] Failed to read metadata from {args.device}")
+            sys.exit(1)
+
+    elif args.command == 'check':
+        # Validate migration readiness without making any changes
+        if utils.check_migration_readiness(args.orig, args.dest, args.meta_orig, args.meta_dest):
+            print("[SUCCESS] All pre-flight checks passed - ready to proceed with migration")
+            sys.exit(0)
+        else:
+            print("[FAILED] Pre-flight checks failed - resolve issues before proceeding")
             sys.exit(1)
 
     # --- LOGIC: prepare-root ---
