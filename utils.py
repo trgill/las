@@ -440,6 +440,21 @@ def check_migration_readiness(source_dev, dest_dev, meta_orig, meta_dest, verbos
     # Minimum sizes in sectors
     MIN_META_SECTORS = 2048  # 1 MB minimum for RAID metadata
 
+    # Helper function to format sizes with appropriate units
+    def format_size(sectors):
+        """Format sector count with appropriate unit (KB, MB, GB)."""
+        bytes_size = sectors * 512
+        kb = bytes_size / 1024
+        mb = kb / 1024
+        gb = mb / 1024
+
+        if gb >= 1.0:
+            return f"{gb:.2f} GB"
+        elif mb >= 1.0:
+            return f"{mb:.2f} MB"
+        else:
+            return f"{kb:.2f} KB"
+
     if verbose:
         print("\n" + "="*60)
         print("LAS Migration Pre-Flight Check")
@@ -452,27 +467,26 @@ def check_migration_readiness(source_dev, dest_dev, meta_orig, meta_dest, verbos
         meta_orig_sectors = get_block_size(meta_orig)
         meta_dest_sectors = get_block_size(meta_dest)
 
-        # Convert to human-readable sizes
-        def sectors_to_gb(sectors):
-            return (sectors * 512) / (1024**3)
-
         if verbose:
             print(f"\n[*] Device Size Report:")
             print(f"    Source Data:      {source_dev}")
-            print(f"      Size:           {src_sectors:,} sectors ({sectors_to_gb(src_sectors):.2f} GB)")
+            print(f"      Size:           {src_sectors:,} sectors ({format_size(src_sectors)})")
             print(f"\n    Destination Data: {dest_dev}")
-            print(f"      Size:           {dest_sectors:,} sectors ({sectors_to_gb(dest_sectors):.2f} GB)")
+            print(f"      Size:           {dest_sectors:,} sectors ({format_size(dest_sectors)})")
 
             if dest_sectors >= src_sectors:
                 extra = dest_sectors - src_sectors
-                print(f"      Surplus:        {extra:,} sectors ({sectors_to_gb(extra):.2f} GB) ✓")
+                if extra > 0:
+                    print(f"      Surplus:        {extra:,} sectors ({format_size(extra)}) ✓")
+                else:
+                    print(f"      Match:          Exact size match ✓")
             else:
                 shortage = src_sectors - dest_sectors
-                print(f"      SHORTAGE:       {shortage:,} sectors ({sectors_to_gb(shortage):.2f} GB) ✗")
+                print(f"      SHORTAGE:       {shortage:,} sectors ({format_size(shortage)}) ✗")
 
             print(f"\n    Source Metadata:  {meta_orig}")
-            print(f"      Size:           {meta_orig_sectors:,} sectors ({sectors_to_gb(meta_orig_sectors):.2f} GB)")
-            print(f"      Required:       {MIN_META_SECTORS:,} sectors ({sectors_to_gb(MIN_META_SECTORS):.2f} GB)")
+            print(f"      Size:           {meta_orig_sectors:,} sectors ({format_size(meta_orig_sectors)})")
+            print(f"      Required:       {MIN_META_SECTORS:,} sectors ({format_size(MIN_META_SECTORS)})")
 
             if meta_orig_sectors >= MIN_META_SECTORS:
                 print(f"      Status:         ✓ OK")
@@ -480,8 +494,8 @@ def check_migration_readiness(source_dev, dest_dev, meta_orig, meta_dest, verbos
                 print(f"      Status:         ✗ TOO SMALL")
 
             print(f"\n    Dest Metadata:    {meta_dest}")
-            print(f"      Size:           {meta_dest_sectors:,} sectors ({sectors_to_gb(meta_dest_sectors):.2f} GB)")
-            print(f"      Required:       {MIN_META_SECTORS:,} sectors ({sectors_to_gb(MIN_META_SECTORS):.2f} GB)")
+            print(f"      Size:           {meta_dest_sectors:,} sectors ({format_size(meta_dest_sectors)})")
+            print(f"      Required:       {MIN_META_SECTORS:,} sectors ({format_size(MIN_META_SECTORS)})")
 
             if meta_dest_sectors >= MIN_META_SECTORS:
                 print(f"      Status:         ✓ OK")
@@ -495,18 +509,18 @@ def check_migration_readiness(source_dev, dest_dev, meta_orig, meta_dest, verbos
         # Check 1: Destination must be >= source size
         if dest_sectors < src_sectors:
             shortage = src_sectors - dest_sectors
-            errors.append(f"Destination is {shortage:,} sectors ({sectors_to_gb(shortage):.2f} GB) too small")
+            errors.append(f"Destination is {shortage:,} sectors ({format_size(shortage)}) too small")
             checks_passed = False
 
         # Check 2: Metadata devices must meet minimum size
         if meta_orig_sectors < MIN_META_SECTORS:
             shortage = MIN_META_SECTORS - meta_orig_sectors
-            errors.append(f"Source metadata device is {shortage:,} sectors too small (minimum {MIN_META_SECTORS:,})")
+            errors.append(f"Source metadata device is {shortage:,} sectors ({format_size(shortage)}) too small (minimum {format_size(MIN_META_SECTORS)})")
             checks_passed = False
 
         if meta_dest_sectors < MIN_META_SECTORS:
             shortage = MIN_META_SECTORS - meta_dest_sectors
-            errors.append(f"Destination metadata device is {shortage:,} sectors too small (minimum {MIN_META_SECTORS:,})")
+            errors.append(f"Destination metadata device is {shortage:,} sectors ({format_size(shortage)}) too small (minimum {format_size(MIN_META_SECTORS)})")
             checks_passed = False
 
         if verbose:
