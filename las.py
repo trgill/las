@@ -365,6 +365,8 @@ def main():
     # --- 6. Command: break ---
     brk = subparsers.add_parser('break', help='Finalize and remove mirror')
     brk.add_argument('--name', default='migration')
+    brk.add_argument('--commit', action='store_true',
+                     help='Regenerate UUID on origin disk to prevent conflicts')
 
     rvt = subparsers.add_parser('revert', help='Revert to origin and cleanup migration metadata')
     rvt.add_argument('--name', required=True, help='Name of the migration to revert')
@@ -422,13 +424,37 @@ def main():
         rec = database.get_migration(args.name)
         if not rec:
             print("[!] No record found."); sys.exit(1)
-        
+
         _, pct = engine.get_status()
         if "100.00%" not in pct:
             if input(f"[!] Sync incomplete ({pct}). Finalize anyway? (y/N): ").lower() != 'y': sys.exit(0)
 
         engine.cleanup_boom_entry()
         engine.stop()
+
+        # If --commit flag is set, regenerate UUID on origin to prevent conflicts
+        if args.commit:
+            print(f"\n[*] Committing migration: regenerating origin UUID...")
+            origin_dev = rec['orig']
+            fstype = rec.get('fstype', 'xfs')  # Default to xfs if not in DB
+
+            # Convert persistent path back to /dev/sdXN if needed
+            # (UUID tools work on actual device paths)
+            if origin_dev.startswith('/dev/disk/by-id/'):
+                try:
+                    actual_dev = os.path.realpath(origin_dev)
+                    print(f"[*] Origin device: {origin_dev} -> {actual_dev}")
+                    origin_dev = actual_dev
+                except Exception as e:
+                    print(f"[!] Warning: Could not resolve device path: {e}")
+
+            if not utils.regenerate_filesystem_uuid(origin_dev, fstype):
+                print("[!] WARNING: Failed to regenerate origin UUID")
+                print("[!] Manual intervention may be needed to prevent UUID conflicts")
+            else:
+                print(f"[*] Origin disk {origin_dev} now has a unique UUID")
+                print(f"[*] Destination disk has taken over with the original UUID")
+
         database.delete_migration(args.name)
         print("[SUCCESS] Finalized.")
 

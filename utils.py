@@ -350,6 +350,79 @@ def prime_source_metadata(engine, origin, meta_orig):
     # This identifies 'origin' as the valid data source.
     return engine.write_dm_raid_superblock(meta_orig, origin_uuid=engine.get_uuid(origin))
 
+def regenerate_filesystem_uuid(device, fstype):
+    """
+    Generates a new UUID for a filesystem to prevent conflicts.
+
+    Args:
+        device (str): Block device path (e.g., /dev/sda1)
+        fstype (str): Filesystem type (xfs, ext4, btrfs, etc.)
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    import subprocess
+
+    print(f"[*] Regenerating UUID for {device} ({fstype})...")
+
+    try:
+        if fstype == 'xfs':
+            # XFS: xfs_admin -U generate
+            subprocess.run(
+                ['xfs_admin', '-U', 'generate', device],
+                check=True,
+                capture_output=True,
+                text=True
+            )
+            print(f"[SUCCESS] XFS UUID regenerated on {device}")
+
+        elif fstype in ['ext2', 'ext3', 'ext4']:
+            # ext* family: tune2fs -U random
+            subprocess.run(
+                ['tune2fs', '-U', 'random', device],
+                check=True,
+                capture_output=True,
+                text=True
+            )
+            print(f"[SUCCESS] ext{fstype[-1]} UUID regenerated on {device}")
+
+        elif fstype == 'btrfs':
+            # Btrfs: btrfstune -u (generates random UUID)
+            subprocess.run(
+                ['btrfstune', '-u', device],
+                check=True,
+                capture_output=True,
+                text=True
+            )
+            print(f"[SUCCESS] Btrfs UUID regenerated on {device}")
+
+        else:
+            print(f"[!] Unsupported filesystem type for UUID regeneration: {fstype}")
+            return False
+
+        # Display new UUID
+        result = subprocess.run(
+            ['blkid', '-s', 'UUID', '-o', 'value', device],
+            capture_output=True,
+            text=True,
+            check=False
+        )
+        if result.returncode == 0:
+            new_uuid = result.stdout.strip()
+            print(f"[*] New UUID: {new_uuid}")
+
+        return True
+
+    except subprocess.CalledProcessError as e:
+        print(f"[!] Failed to regenerate UUID: {e}")
+        if e.stderr:
+            print(f"[!] Error: {e.stderr}")
+        return False
+    except Exception as e:
+        print(f"[!] Unexpected error: {e}")
+        return False
+
+
 def validate_migration_geometry(source_dev, dest_dev, meta_orig, meta_dest):
     """
     Checks all involved disks to ensure the migration will physically fit.
