@@ -319,6 +319,124 @@ def prepare_root(engine, name, origin, dest, meta_orig, meta_dest):
     print(f"[ACTION] Run: grub2-reboot 'LAS-{name}' && reboot")
     return True
 
+
+def prepare_root_lvm(engine, name, origin, dest, meta_orig, meta_dest):
+    """
+    Preparation workflow for LVM-based migrations.
+
+    Similar to prepare_root() but:
+    - No partition table sync
+    - No partition parsing
+    - Uses LVM-specific hook
+    - Records VG/LV info in database
+    """
+    print(f"[*] Starting LVM-based LAS preparation for: {name}")
+
+    # 1. Detect LVM info
+    lvm_info = utils.detect_lvm_info(origin)
+    if not lvm_info or not lvm_info['is_pv']:
+        print(f"[!] {origin} is not an LVM Physical Volume")
+        return False
+
+    # 2. Validate LVM configuration
+    if not utils.validate_lvm_migration(lvm_info, dest):
+        return False
+
+    # 3. Basic geometry validation (dest must be >= origin)
+    if not utils.validate_migration_geometry(origin, dest, meta_orig, meta_dest):
+        sys.exit(1)
+
+    # 4. Get PV size
+    try:
+        origin_sz = int(subprocess.check_output(['blockdev', '--getsz', origin], text=True).strip())
+    except Exception as e:
+        print(f"[!] Could not determine size of {origin}: {e}")
+        return False
+
+    # 5. Prime RAID metadata (same as partition-based)
+    raid.wipe_metadata(meta_orig)
+    if not raid.write_dm_raid_superblock(meta_orig, origin_sz):
+        print("[!] Failed to prime source metadata.")
+        return False
+
+    # 6. Resolve persistent paths
+    p_orig = utils.get_persistent_path(origin)
+    p_dest = utils.get_persistent_path(dest)
+    p_m_orig = utils.get_persistent_path(meta_orig)
+    p_m_dest = utils.get_persistent_path(meta_dest)
+
+    # 7. Inject LVM assembly hook
+    img_path = utils.inject_lvm_assembly_hook(
+        name, p_orig, p_dest, p_m_orig, p_m_dest,
+        lvm_info['vg_name']
+    )
+    if not img_path:
+        return False
+
+    # 8. Detect root LV filesystem
+    root_lv = None
+    for lv in lvm_info['lvs']:
+        # Find which LV is mounted as /
+        try:
+            mount_output = subprocess.check_output(
+                ['findmnt', '-n', '-o', 'SOURCE', '/'],
+                text=True
+            ).strip()
+            if lv['lv_path'] in mount_output:
+                root_lv = lv
+                break
+        except:
+            pass
+
+    if not root_lv:
+        print("[!] Could not identify root LV")
+        return False
+
+    # Get filesystem type
+    try:
+        cmd = ["findmnt", "-n", "-o", "FSTYPE,OPTIONS", "/"]
+        fs_info = subprocess.check_output(cmd, text=True).strip().split()
+        current_fstype = fs_info[0]
+        current_fsflags = fs_info[1]
+
+        print(f"[*] Root LV: {root_lv['lv_name']}")
+        print(f"[*] Filesystem: {current_fstype}")
+        print(f"[*] Mount flags: {current_fsflags}")
+    except Exception as e:
+        print(f"[!] Could not detect filesystem info: {e}")
+        return False
+
+    # 9. Record migration in database
+    print("[*] Updating migration database...")
+    database.record_migration(
+        name=name,
+        orig=p_orig,
+        dest=p_dest,
+        meta_orig=p_m_orig,
+        meta_dest=p_m_dest,
+        throttle=0,
+        fstype=current_fstype,
+        fsflags=current_fsflags
+    )
+
+    # TODO: Store LVM-specific info (vg_name, lv_name) in database
+    # May require schema change
+
+    # 10. Create Boom boot entry
+    # For LVM, root device is /dev/mapper/vg_name-lv_root
+    # Note: setup_boom_entry currently auto-detects from current mounts
+    # For LVM, it should already work since the root is on an LV
+    if not engine.setup_boom_entry(img_path, current_fstype, current_fsflags):
+        print("[!] Failed to register Boom boot entry.")
+        return False
+
+    print(f"\n[SUCCESS] LVM-based LAS prepared for '{name}'.")
+    print(f"[*] Volume Group: {lvm_info['vg_name']}")
+    print(f"[*] Root LV: {root_lv['lv_name']}")
+    print(f"[ACTION] Run: grub2-reboot 'LAS-{name}' && reboot")
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="las: Lift and Shift - Block Device Migration Tool"
@@ -421,7 +539,16 @@ def main():
     # --- LOGIC: prepare-root ---
     # This command prepares a system for a "Pivot-on-Reboot" migration.
     elif args.command == 'prepare-root':
-        prepare_root(engine, name, args.orig, args.dest, args.meta_orig, args.meta_dest)
+        # Auto-detect LVM vs partition-based
+        lvm_info = utils.detect_lvm_info(args.orig)
+
+        if lvm_info and lvm_info['is_pv']:
+            print(f"[*] Detected LVM Physical Volume on {args.orig}")
+            print(f"[*] VG: {lvm_info['vg_name']}, LVs: {len(lvm_info['lvs'])}")
+            prepare_root_lvm(engine, args.name, args.orig, args.dest, args.meta_orig, args.meta_dest)
+        else:
+            print(f"[*] Detected partition-based device on {args.orig}")
+            prepare_root(engine, args.name, args.orig, args.dest, args.meta_orig, args.meta_dest)
 
     elif args.command == 'activate':
         if engine.activate_passive(args.orig, args.dest, args.meta_orig, args.meta_dest):
@@ -465,12 +592,26 @@ def main():
                 except Exception as e:
                     print(f"[!] Warning: Could not resolve device path: {e}")
 
-            if not utils.regenerate_filesystem_uuid(origin_dev, fstype):
-                print("[!] WARNING: Failed to regenerate origin UUID")
-                print("[!] Manual intervention may be needed to prevent UUID conflicts")
+            # Detect if LVM or partition-based
+            lvm_info = utils.detect_lvm_info(origin_dev)
+
+            if lvm_info and lvm_info['is_pv']:
+                # LVM: regenerate PV UUID
+                print(f"[*] Detected LVM Physical Volume")
+                if not utils.regenerate_pv_uuid(origin_dev):
+                    print("[!] WARNING: Failed to regenerate PV UUID")
+                    print("[!] Manual intervention may be needed to prevent UUID conflicts")
+                else:
+                    print(f"[*] Origin PV {origin_dev} now has a unique UUID")
+                    print(f"[*] Destination PV has taken over with the original UUID")
             else:
-                print(f"[*] Origin disk {origin_dev} now has a unique UUID")
-                print(f"[*] Destination disk has taken over with the original UUID")
+                # Partition-based: regenerate filesystem UUID
+                if not utils.regenerate_filesystem_uuid(origin_dev, fstype):
+                    print("[!] WARNING: Failed to regenerate origin UUID")
+                    print("[!] Manual intervention may be needed to prevent UUID conflicts")
+                else:
+                    print(f"[*] Origin disk {origin_dev} now has a unique UUID")
+                    print(f"[*] Destination disk has taken over with the original UUID")
 
         database.delete_migration(args.name)
         print("[SUCCESS] Finalized.")

@@ -249,6 +249,150 @@ echo "LAS: RAID device: /dev/mapper/{name} with $MAPPED partition(s)"
         print(f"[!] Dracut failed.")
         return None
     
+def inject_lvm_assembly_hook(name, p_orig, p_dest, p_m_orig, p_m_dest, vg_name, throttle_kibs=3072):
+    """
+    Generates an initramfs hook for LVM-based migrations.
+
+    Differences from partition-based hook:
+    - No partition table parsing or dm-linear mappings
+    - Activates VG after RAID assembly via vgchange -ay
+    - Root device is /dev/mapper/vg_name-lv_root
+
+    Args:
+        name (str): Migration name (e.g., "migration")
+        p_orig, p_dest, p_m_orig, p_m_dest (str): Persistent device paths
+        vg_name (str): LVM Volume Group name
+        throttle_kibs (int): Initial sync throttle in KiB/s
+
+    Returns:
+        str: Path to generated initramfs, or None on failure
+    """
+    rate = throttle_kibs
+    max_rate = rate * 10  # 10x throttle for max recovery rate
+
+    hook_content = f"""#!/bin/sh
+# LAS LVM Assembly Hook
+# Auto-generated for migration: {name}
+# Volume Group: {vg_name}
+
+set -e  # Exit on error
+
+echo "LAS-LVM: Starting hardware discovery..."
+udevadm settle --timeout=30
+
+# Wait for physical source PV
+i=0
+while [ $i -lt 15 ]; do
+    [ -e "{p_orig}" ] && break
+    sleep 1
+    i=$((i+1))
+done
+
+if [ ! -e "{p_orig}" ]; then
+    echo "LAS-LVM: ERROR - Source PV {p_orig} not found!"
+    exit 1
+fi
+
+echo "LAS-LVM: Source PV {p_orig} ready"
+
+# Deactivate origin VG to prevent conflicts
+echo "LAS-LVM: Deactivating origin VG {vg_name}..."
+vgchange -an {vg_name} 2>/dev/null || true
+
+# Clean up any stale mapper devices
+if dmsetup info {name} >/dev/null 2>&1; then
+    echo "LAS-LVM: Removing stale {name}..."
+    dmsetup remove {name} 2>/dev/null || true
+fi
+
+# Flush buffers
+blockdev --flushbufs {p_orig} 2>/dev/null || true
+
+# Get PV size
+SIZE=$(blockdev --getsz {p_orig})
+echo "LAS-LVM: PV size: $SIZE sectors"
+
+# Assemble the RAID Mirror
+TABLE="0 $SIZE raid raid1 7 1024 rebuild 1 min_recovery_rate {rate} max_recovery_rate {max_rate} 2 {p_m_orig} {p_orig} {p_m_dest} {p_dest}"
+echo "LAS-LVM: Assembling /dev/mapper/{name}..."
+if ! echo "$TABLE" | dmsetup create {name}; then
+    echo "LAS-LVM: ERROR - Failed to create RAID mirror"
+    echo "LAS-LVM: Diagnostic information:"
+    dmsetup ls || true
+    lsblk -o NAME,MAJ:MIN,SIZE,TYPE,MOUNTPOINT || true
+    exit 1
+fi
+
+# Verify RAID device appeared
+if [ ! -e "/dev/mapper/{name}" ]; then
+    echo "LAS-LVM: ERROR - RAID device did not appear"
+    exit 1
+fi
+
+udevadm settle --timeout=10
+
+# Scan for LVM on the RAID mirror
+echo "LAS-LVM: Scanning for Volume Groups..."
+pvscan --cache /dev/mapper/{name} || true
+vgscan --cache || true
+
+# Activate the VG on the mirror
+echo "LAS-LVM: Activating VG {vg_name} on /dev/mapper/{name}..."
+if ! vgchange -ay {vg_name}; then
+    echo "LAS-LVM: ERROR - Failed to activate VG {vg_name}"
+    echo "LAS-LVM: VG status:"
+    vgdisplay {vg_name} || true
+    exit 1
+fi
+
+# Verify LVs are available
+echo "LAS-LVM: Verifying Logical Volumes..."
+lvscan | grep {vg_name} || true
+
+udevadm settle --timeout=10
+echo "LAS-LVM: Volume Group {vg_name} ready. Recovery running at {rate} KiB/s."
+"""
+
+    hook_name = f"99-las-lvm-assemble-{name}.sh"
+    hook_path = f"/tmp/{hook_name}"
+
+    try:
+        with open(hook_path, 'w') as f:
+            f.write(hook_content)
+        os.chmod(hook_path, 0o755)
+
+        print(f"[*] LVM assembly hook created: {hook_path}")
+    except Exception as e:
+        print(f"[!] Failed to write LVM hook: {e}")
+        return None
+
+    # Build initramfs with the hook
+    kver = subprocess.check_output(['uname', '-r'], text=True).strip()
+    img_name = f"initramfs-las-{name}.img"
+    img_path = f"/boot/{img_name}"
+
+    print(f"[*] Building initramfs with LVM support...")
+
+    # dracut needs LVM modules and tools
+    dracut_cmd = [
+        "dracut",
+        "--force",
+        "--add", "lvm",  # Include LVM dracut module
+        "--include", hook_path, f"/usr/lib/dracut/hooks/pre-mount/{hook_name}",
+        img_path,
+        kver
+    ]
+
+    result = subprocess.run(dracut_cmd, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        print(f"[!] Dracut failed: {result.stderr}")
+        return None
+
+    print(f"[SUCCESS] Initramfs created: {img_path}")
+    return img_path
+
+
 def remove_las_assembly_hook(name):
     """
     Removes the LAS hook and rebuilds the Initramfs to a standard state.
@@ -256,14 +400,14 @@ def remove_las_assembly_hook(name):
     try:
         kver = subprocess.check_output(['uname', '-r'], text=True).strip()
         initrd_path = f"/boot/initramfs-{kver}.img"
-        
+
         print(f"[*] Removing LAS hook for '{name}' and restoring Initramfs...")
-        
-        # We run dracut without the --include flag. 
-        # This effectively rebuilds the image based on the system's standard 
+
+        # We run dracut without the --include flag.
+        # This effectively rebuilds the image based on the system's standard
         # configuration, dropping our custom script.
         subprocess.run(['sudo', 'dracut', '--force', initrd_path, kver], check=True)
-        
+
         print(f"[SUCCESS] Initramfs restored. LAS hook removed.")
         return True
     except Exception as e:
@@ -420,6 +564,213 @@ def regenerate_filesystem_uuid(device, fstype):
         return False
     except Exception as e:
         print(f"[!] Unexpected error: {e}")
+        return False
+
+
+def detect_lvm_info(device):
+    """
+    Detects if a device is an LVM Physical Volume and extracts VG/LV information.
+
+    Args:
+        device (str): Device path (e.g., /dev/sda2, /dev/nvme0n1p2)
+
+    Returns:
+        dict or None: LVM info if PV detected, None otherwise
+
+    Example return value:
+    {
+        'is_pv': True,
+        'pv_name': '/dev/sda2',
+        'pv_uuid': 'abc123...',
+        'vg_name': 'fedora',
+        'vg_uuid': 'def456...',
+        'lvs': [
+            {'lv_name': 'root', 'lv_path': '/dev/mapper/fedora-root', 'size_sectors': 123456},
+            {'lv_name': 'home', 'lv_path': '/dev/mapper/fedora-home', 'size_sectors': 234567},
+        ]
+    }
+    """
+    import re
+    import subprocess
+
+    try:
+        # Check if device is a Physical Volume
+        # pvdisplay -c outputs colon-separated format:
+        # /dev/sda2:fedora:251658240:-1:8:8:-1:4096:30719:0:30719:abc-123-def...
+        pv_output = subprocess.check_output(
+            ['pvdisplay', '-c', device],
+            text=True,
+            stderr=subprocess.DEVNULL
+        ).strip()
+
+        if not pv_output:
+            return None  # Not a PV
+
+        # Parse PV info
+        fields = pv_output.split(':')
+        pv_name = fields[0]
+        vg_name = fields[1]
+        pv_uuid = fields[11] if len(fields) > 11 else None
+
+        if not vg_name or vg_name == '-':
+            print(f"[!] {device} is a PV but not assigned to any VG")
+            return None
+
+        # Get VG UUID
+        vg_uuid_output = subprocess.check_output(
+            ['vgdisplay', '-c', vg_name],
+            text=True,
+            stderr=subprocess.DEVNULL
+        ).strip()
+        vg_uuid = vg_uuid_output.split(':')[11] if vg_uuid_output else None
+
+        # Get all LVs in the VG
+        # lvdisplay -c outputs: /dev/fedora/root:fedora:3:1:-1:1:...
+        lv_output = subprocess.check_output(
+            ['lvdisplay', '-c'],
+            text=True,
+            stderr=subprocess.DEVNULL
+        ).strip().splitlines()
+
+        lvs = []
+        for line in lv_output:
+            fields = line.split(':')
+            lv_path = fields[0]
+            lv_vg = fields[1]
+
+            if lv_vg == vg_name:
+                lv_name = lv_path.split('/')[-1]
+                # Get size in sectors (512-byte)
+                lv_size_output = subprocess.check_output(
+                    ['blockdev', '--getsz', lv_path],
+                    text=True
+                ).strip()
+
+                lvs.append({
+                    'lv_name': lv_name,
+                    'lv_path': lv_path,
+                    'size_sectors': int(lv_size_output)
+                })
+
+        return {
+            'is_pv': True,
+            'pv_name': pv_name,
+            'pv_uuid': pv_uuid,
+            'vg_name': vg_name,
+            'vg_uuid': vg_uuid,
+            'lvs': lvs
+        }
+
+    except subprocess.CalledProcessError:
+        # Not an LVM PV
+        return None
+    except Exception as e:
+        print(f"[!] Error detecting LVM info for {device}: {e}")
+        return None
+
+
+def validate_lvm_migration(origin_lvm_info, dest):
+    """
+    Validates LVM migration readiness.
+
+    Args:
+        origin_lvm_info (dict): LVM info from detect_lvm_info()
+        dest (str): Destination device path
+
+    Returns:
+        bool: True if valid, False otherwise
+    """
+    # Check destination is not also a PV
+    dest_lvm = detect_lvm_info(dest)
+    if dest_lvm:
+        print(f"[!] Destination {dest} is already an LVM PV")
+        print(f"[!] VG: {dest_lvm['vg_name']}")
+        print(f"[!] Please use a clean device or wipe with: vgremove {dest_lvm['vg_name']} && pvremove {dest}")
+        return False
+
+    # Check we have at least one LV
+    if not origin_lvm_info['lvs']:
+        print(f"[!] VG {origin_lvm_info['vg_name']} has no Logical Volumes")
+        return False
+
+    # Check if multiple PVs in VG (not supported yet)
+    try:
+        pv_count_output = subprocess.check_output(
+            ['vgdisplay', '-c', origin_lvm_info['vg_name']],
+            text=True
+        ).strip()
+        # Field 9 is PV count
+        pv_count = int(pv_count_output.split(':')[9])
+
+        if pv_count > 1:
+            print(f"[!] VG {origin_lvm_info['vg_name']} spans {pv_count} Physical Volumes")
+            print(f"[!] Multi-PV migration is not supported yet")
+            return False
+    except Exception as e:
+        print(f"[!] Could not verify PV count: {e}")
+        return False
+
+    print(f"[*] LVM validation passed:")
+    print(f"    VG: {origin_lvm_info['vg_name']}")
+    print(f"    PV: {origin_lvm_info['pv_name']}")
+    print(f"    LVs: {', '.join([lv['lv_name'] for lv in origin_lvm_info['lvs']])}")
+
+    return True
+
+
+def regenerate_pv_uuid(device):
+    """
+    Regenerates LVM Physical Volume UUID to prevent conflicts.
+
+    Used during break --commit to give origin PV a new UUID
+    so it doesn't conflict with the migrated destination.
+
+    Args:
+        device (str): PV device path (e.g., /dev/sda2)
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    import subprocess
+
+    try:
+        # Verify it's actually a PV
+        lvm_info = detect_lvm_info(device)
+        if not lvm_info or not lvm_info['is_pv']:
+            print(f"[!] {device} is not an LVM Physical Volume")
+            return False
+
+        vg_name = lvm_info['vg_name']
+        old_uuid = lvm_info['pv_uuid']
+
+        print(f"[*] Current PV UUID: {old_uuid}")
+        print(f"[*] Generating new UUID for {device}...")
+
+        # pvchange -u generates a new random UUID
+        result = subprocess.run(
+            ['sudo', 'pvchange', '-u', device],
+            capture_output=True,
+            text=True
+        )
+
+        if result.returncode != 0:
+            print(f"[!] pvchange failed: {result.stderr}")
+            return False
+
+        # Verify new UUID
+        new_lvm_info = detect_lvm_info(device)
+        new_uuid = new_lvm_info['pv_uuid'] if new_lvm_info else None
+
+        if new_uuid and new_uuid != old_uuid:
+            print(f"[SUCCESS] PV UUID regenerated: {new_uuid}")
+            print(f"[*] VG {vg_name} will need to rescan PVs on next boot")
+            return True
+        else:
+            print(f"[!] UUID did not change")
+            return False
+
+    except Exception as e:
+        print(f"[!] PV UUID regeneration failed: {e}")
         return False
 
 
