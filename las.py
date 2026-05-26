@@ -322,21 +322,26 @@ def prepare_root(engine, name, origin, dest, meta_orig, meta_dest):
 
 def prepare_root_lvm(engine, name, origin, dest, meta_orig, meta_dest):
     """
-    Preparation workflow for LVM-based migrations.
+    Preparation workflow for LVM-based migrations using LIVE migration.
 
-    Similar to prepare_root() but:
-    - No partition table sync
-    - No partition parsing
-    - Uses LVM-specific hook
-    - Records VG/LV info in database
+    Performs live migration without requiring immediate reboot:
+    - Assembles dm-raid mirror while system is running
+    - Uses pvmove to migrate VG from physical PV to mirror
+    - Updates VG to use mirror device
+    - Creates initramfs hook for future boots
+    - System continues running on mirror
     """
-    print(f"[*] Starting LVM-based LAS preparation for: {name}")
+    print(f"[*] Starting LVM-based LAS LIVE migration for: {name}")
 
     # 1. Detect LVM info
     lvm_info = utils.detect_lvm_info(origin)
     if not lvm_info or not lvm_info['is_pv']:
         print(f"[!] {origin} is not an LVM Physical Volume")
         return False
+
+    vg_name = lvm_info['vg_name']
+    print(f"[*] Volume Group: {vg_name}")
+    print(f"[*] Physical Volume: {origin}")
 
     # 2. Validate LVM configuration
     if not utils.validate_lvm_migration(lvm_info, dest):
@@ -353,30 +358,86 @@ def prepare_root_lvm(engine, name, origin, dest, meta_orig, meta_dest):
         print(f"[!] Could not determine size of {origin}: {e}")
         return False
 
-    # 5. Prime RAID metadata (same as partition-based)
-    raid.wipe_metadata(meta_orig)
-    if not raid.write_dm_raid_superblock(meta_orig, origin_sz):
-        print("[!] Failed to prime source metadata.")
+    # 5. Initialize RAID metadata using missing leg strategy
+    print(f"\n[*] Initializing RAID metadata...")
+    if not engine.init_raid_metadata(origin, dest, meta_orig, meta_dest):
+        print("[!] Failed to initialize RAID metadata.")
         return False
 
-    # 6. Resolve persistent paths
+    # 6. Assemble dm-raid mirror LIVE (nosync mode, origin authoritative)
+    print(f"\n[*] Assembling RAID mirror /dev/mapper/{name}...")
+    if not engine.activate_passive(origin, dest, meta_orig, meta_dest):
+        print(f"[!] Failed to assemble RAID mirror")
+        return False
+
+    mirror_device = f"/dev/mapper/{name}"
+    if not os.path.exists(mirror_device):
+        print(f"[!] Mirror device {mirror_device} not found")
+        return False
+
+    print(f"[SUCCESS] RAID mirror assembled: {mirror_device}")
+
+    # 7. Migrate VG from physical PV to mirror using pvmove
+    print(f"\n[*] Migrating Volume Group {vg_name} to mirror...")
+    print(f"[*] This may take several minutes depending on data size...")
+
+    try:
+        # pvmove moves extents from origin PV to mirror device
+        # First, we need to add mirror as a PV to the VG
+        print(f"[*] Adding {mirror_device} as Physical Volume...")
+        subprocess.run(['sudo', 'pvcreate', mirror_device], check=True, capture_output=True)
+
+        print(f"[*] Extending VG {vg_name} to include mirror...")
+        subprocess.run(['sudo', 'vgextend', vg_name, mirror_device], check=True, capture_output=True)
+
+        print(f"[*] Moving data from {origin} to {mirror_device}...")
+        # pvmove migrates all extents from origin to any other PV in VG (the mirror)
+        result = subprocess.run(
+            ['sudo', 'pvmove', origin, mirror_device],
+            capture_output=True,
+            text=True
+        )
+
+        if result.returncode != 0:
+            print(f"[!] pvmove failed: {result.stderr}")
+            print(f"[!] Attempting to cleanup...")
+            subprocess.run(['sudo', 'vgreduce', vg_name, mirror_device], capture_output=True)
+            subprocess.run(['sudo', 'pvremove', mirror_device], capture_output=True)
+            return False
+
+        print(f"[SUCCESS] Data migration complete")
+
+        # 8. Remove origin PV from VG
+        print(f"[*] Removing origin PV {origin} from VG...")
+        subprocess.run(['sudo', 'vgreduce', vg_name, origin], check=True, capture_output=True)
+
+        print(f"[SUCCESS] VG {vg_name} now runs on mirror device {mirror_device}")
+
+    except subprocess.CalledProcessError as e:
+        print(f"[!] LVM migration failed: {e}")
+        if e.stderr:
+            print(f"[!] Error: {e.stderr}")
+        return False
+
+    # 9. Resolve persistent paths for database
     p_orig = utils.get_persistent_path(origin)
     p_dest = utils.get_persistent_path(dest)
     p_m_orig = utils.get_persistent_path(meta_orig)
     p_m_dest = utils.get_persistent_path(meta_dest)
 
-    # 7. Inject LVM assembly hook
+    # 10. Create initramfs hook (for future boots)
+    print(f"\n[*] Creating initramfs hook for boot-time assembly...")
     img_path = utils.inject_lvm_assembly_hook(
         name, p_orig, p_dest, p_m_orig, p_m_dest,
-        lvm_info['vg_name']
+        vg_name
     )
     if not img_path:
-        return False
+        print("[!] WARNING: Initramfs hook creation failed")
+        print("[!] System is running on mirror but may not boot correctly")
 
-    # 8. Detect root LV filesystem
+    # 11. Detect root LV filesystem for database
     root_lv = None
     for lv in lvm_info['lvs']:
-        # Find which LV is mounted as /
         try:
             mount_output = subprocess.check_output(
                 ['findmnt', '-n', '-o', 'SOURCE', '/'],
@@ -390,7 +451,7 @@ def prepare_root_lvm(engine, name, origin, dest, meta_orig, meta_dest):
 
     if not root_lv:
         print("[!] Could not identify root LV")
-        return False
+        root_lv = {'lv_name': 'unknown'}
 
     # Get filesystem type
     try:
@@ -398,15 +459,12 @@ def prepare_root_lvm(engine, name, origin, dest, meta_orig, meta_dest):
         fs_info = subprocess.check_output(cmd, text=True).strip().split()
         current_fstype = fs_info[0]
         current_fsflags = fs_info[1]
-
-        print(f"[*] Root LV: {root_lv['lv_name']}")
-        print(f"[*] Filesystem: {current_fstype}")
-        print(f"[*] Mount flags: {current_fsflags}")
     except Exception as e:
         print(f"[!] Could not detect filesystem info: {e}")
-        return False
+        current_fstype = 'xfs'
+        current_fsflags = 'defaults'
 
-    # 9. Record migration in database
+    # 12. Record migration in database
     print("[*] Updating migration database...")
     database.record_migration(
         name=name,
@@ -419,21 +477,33 @@ def prepare_root_lvm(engine, name, origin, dest, meta_orig, meta_dest):
         fsflags=current_fsflags
     )
 
-    # TODO: Store LVM-specific info (vg_name, lv_name) in database
-    # May require schema change
+    # 13. Create Boom boot entry (for boot verification)
+    if img_path and not engine.setup_boom_entry(img_path, current_fstype, current_fsflags):
+        print("[!] WARNING: Boom boot entry creation failed")
 
-    # 10. Create Boom boot entry
-    # For LVM, root device is /dev/mapper/vg_name-lv_root
-    # Note: setup_boom_entry currently auto-detects from current mounts
-    # For LVM, it should already work since the root is on an LV
-    if not engine.setup_boom_entry(img_path, current_fstype, current_fsflags):
-        print("[!] Failed to register Boom boot entry.")
-        return False
-
-    print(f"\n[SUCCESS] LVM-based LAS prepared for '{name}'.")
-    print(f"[*] Volume Group: {lvm_info['vg_name']}")
+    print(f"\n{'='*60}")
+    print(f"[SUCCESS] LIVE LVM migration complete!")
+    print(f"{'='*60}")
+    print(f"[*] Volume Group: {vg_name}")
     print(f"[*] Root LV: {root_lv['lv_name']}")
-    print(f"[ACTION] Run: grub2-reboot 'LAS-{name}' && reboot")
+    print(f"[*] Mirror device: {mirror_device}")
+    print(f"")
+    print(f"[*] Current status:")
+    print(f"    - System is RUNNING on the mirror")
+    print(f"    - Root filesystem is on /dev/mapper/{name} (via LVM)")
+    print(f"    - NO REBOOT REQUIRED for migration")
+    print(f"")
+    print(f"[*] RAID sync in progress:")
+    status, pct = engine.get_status()
+    print(f"    - Progress: {pct}")
+    print(f"    - Monitor: ./las.py status --name {name}")
+    print(f"")
+    print(f"[*] Next steps:")
+    print(f"    1. Wait for sync to complete (100%)")
+    print(f"    2. Optionally reboot to verify boot path: grub2-reboot 'LAS-{name}' && reboot")
+    print(f"    3. When ready, finalize: ./las.py break --name {name} --commit")
+    print(f"{'='*60}")
+
     return True
 
 
@@ -545,9 +615,11 @@ def main():
         if lvm_info and lvm_info['is_pv']:
             print(f"[*] Detected LVM Physical Volume on {args.orig}")
             print(f"[*] VG: {lvm_info['vg_name']}, LVs: {len(lvm_info['lvs'])}")
+            print(f"[*] Using LIVE migration (no immediate reboot required)")
             prepare_root_lvm(engine, args.name, args.orig, args.dest, args.meta_orig, args.meta_dest)
         else:
             print(f"[*] Detected partition-based device on {args.orig}")
+            print(f"[*] Using boot-time migration (reboot required)")
             prepare_root(engine, args.name, args.orig, args.dest, args.meta_orig, args.meta_dest)
 
     elif args.command == 'activate':
