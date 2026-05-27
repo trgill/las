@@ -6,3 +6,5 @@ venv/
 .vscode/
 *.swp
 *.swn
+.claude
+las_migration.db
