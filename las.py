@@ -320,18 +320,19 @@ def prepare_root(engine, name, origin, dest, meta_orig, meta_dest):
     return True
 
 
-def prepare_root_lvm(engine, name, origin, dest, meta_orig, meta_dest):
+def prepare_root_lvm(engine, name, origin, dest):
     """
-    Preparation workflow for LVM-based migrations using LIVE migration.
+    LVM-based live migration using LVM's native RAID1 support.
 
-    Performs live migration without requiring immediate reboot:
-    - Assembles dm-raid mirror while system is running
-    - Uses pvmove to migrate VG from physical PV to mirror
-    - Updates VG to use mirror device
-    - Creates initramfs hook for future boots
-    - System continues running on mirror
+    Uses lvconvert --type raid1 to convert linear LVs to mirrored LVs.
+    This approach:
+    - Uses LVM's built-in RAID instead of dm-raid
+    - No external metadata devices needed
+    - No initramfs hooks needed (LVM handles boot automatically)
+    - No Boom entries needed
+    - Standard industry practice for LVM migrations
     """
-    print(f"[*] Starting LVM-based LAS LIVE migration for: {name}")
+    print(f"[*] Starting LVM native RAID1 migration for: {name}")
 
     # 1. Detect LVM info
     lvm_info = utils.detect_lvm_info(origin)
@@ -340,118 +341,110 @@ def prepare_root_lvm(engine, name, origin, dest, meta_orig, meta_dest):
         return False
 
     vg_name = lvm_info['vg_name']
+    lvs = lvm_info['lvs']
+
     print(f"[*] Volume Group: {vg_name}")
-    print(f"[*] Physical Volume: {origin}")
+    print(f"[*] Origin PV: {origin}")
+    print(f"[*] Destination PV: {dest}")
+    print(f"[*] Logical Volumes: {', '.join([lv['lv_name'] for lv in lvs])}")
 
     # 2. Validate LVM configuration
     if not utils.validate_lvm_migration(lvm_info, dest):
         return False
 
-    # 3. Basic geometry validation (dest must be >= origin)
-    if not utils.validate_migration_geometry(origin, dest, meta_orig, meta_dest):
-        sys.exit(1)
-
-    # 4. Get PV size
+    # 3. Check destination size
     try:
         origin_sz = int(subprocess.check_output(['blockdev', '--getsz', origin], text=True).strip())
+        dest_sz = int(subprocess.check_output(['blockdev', '--getsz', dest], text=True).strip())
+
+        if dest_sz < origin_sz:
+            print(f"[!] Destination ({dest_sz} sectors) smaller than origin ({origin_sz} sectors)")
+            return False
     except Exception as e:
-        print(f"[!] Could not determine size of {origin}: {e}")
+        print(f"[!] Could not determine device sizes: {e}")
         return False
 
-    # 5. Initialize RAID metadata using missing leg strategy
-    print(f"\n[*] Initializing RAID metadata...")
-    if not engine.init_raid_metadata(origin, dest, meta_orig, meta_dest):
-        print("[!] Failed to initialize RAID metadata.")
-        return False
-
-    # 6. Assemble dm-raid mirror LIVE (nosync mode, origin authoritative)
-    print(f"\n[*] Assembling RAID mirror /dev/mapper/{name}...")
-    if not engine.activate_passive(origin, dest, meta_orig, meta_dest):
-        print(f"[!] Failed to assemble RAID mirror")
-        return False
-
-    mirror_device = f"/dev/mapper/{name}"
-    if not os.path.exists(mirror_device):
-        print(f"[!] Mirror device {mirror_device} not found")
-        return False
-
-    print(f"[SUCCESS] RAID mirror assembled: {mirror_device}")
-
-    # 7. Migrate VG from physical PV to mirror using pvmove
-    print(f"\n[*] Migrating Volume Group {vg_name} to mirror...")
-    print(f"[*] This may take several minutes depending on data size...")
-
+    # 4. Add destination as PV to VG
+    print(f"\n[*] Adding {dest} as Physical Volume...")
     try:
-        # pvmove moves extents from origin PV to mirror device
-        # First, we need to add mirror as a PV to the VG
-        print(f"[*] Adding {mirror_device} as Physical Volume...")
-        subprocess.run(['sudo', 'pvcreate', mirror_device], check=True, capture_output=True)
+        subprocess.run(['sudo', 'pvcreate', dest], check=True, capture_output=True, text=True)
+        print(f"[SUCCESS] PV created on {dest}")
+    except subprocess.CalledProcessError as e:
+        print(f"[!] pvcreate failed: {e.stderr}")
+        return False
 
-        print(f"[*] Extending VG {vg_name} to include mirror...")
-        subprocess.run(['sudo', 'vgextend', vg_name, mirror_device], check=True, capture_output=True)
+    print(f"[*] Extending VG {vg_name} to include {dest}...")
+    try:
+        subprocess.run(['sudo', 'vgextend', vg_name, dest], check=True, capture_output=True, text=True)
+        print(f"[SUCCESS] VG extended")
+    except subprocess.CalledProcessError as e:
+        print(f"[!] vgextend failed: {e.stderr}")
+        subprocess.run(['sudo', 'pvremove', dest], capture_output=True)
+        return False
 
-        print(f"[*] Moving data from {origin} to {mirror_device}...")
-        # pvmove migrates all extents from origin to any other PV in VG (the mirror)
-        result = subprocess.run(
-            ['sudo', 'pvmove', origin, mirror_device],
-            capture_output=True,
-            text=True
-        )
+    # 5. Convert each LV to RAID1
+    print(f"\n[*] Converting Logical Volumes to RAID1...")
+    converted_lvs = []
 
-        if result.returncode != 0:
-            print(f"[!] pvmove failed: {result.stderr}")
-            print(f"[!] Attempting to cleanup...")
-            subprocess.run(['sudo', 'vgreduce', vg_name, mirror_device], capture_output=True)
-            subprocess.run(['sudo', 'pvremove', mirror_device], capture_output=True)
+    for lv in lvs:
+        lv_name = lv['lv_name']
+        lv_path = f"{vg_name}/{lv_name}"
+
+        print(f"[*] Converting {lv_name} to RAID1...")
+        try:
+            # lvconvert --type raid1 -m 1 creates a 2-way mirror
+            # LVM will automatically use the new PV (dest) for the mirror leg
+            result = subprocess.run([
+                'sudo', 'lvconvert', '--type', 'raid1', '-m', '1',
+                f'/dev/{lv_path}', dest
+            ], capture_output=True, text=True, input='y\n')
+
+            if result.returncode != 0:
+                print(f"[!] lvconvert failed for {lv_name}: {result.stderr}")
+                print(f"[!] Rolling back conversions...")
+                # Rollback: convert back to linear
+                for converted in converted_lvs:
+                    subprocess.run([
+                        'sudo', 'lvconvert', '-m', '0', f'/dev/{vg_name}/{converted}'
+                    ], capture_output=True, input='y\n')
+                subprocess.run(['sudo', 'vgreduce', vg_name, dest], capture_output=True)
+                subprocess.run(['sudo', 'pvremove', dest], capture_output=True)
+                return False
+
+            converted_lvs.append(lv_name)
+            print(f"[SUCCESS] {lv_name} converted to RAID1")
+
+        except Exception as e:
+            print(f"[!] Unexpected error converting {lv_name}: {e}")
             return False
 
-        print(f"[SUCCESS] Data migration complete")
+    # 6. Display sync status
+    print(f"\n[*] RAID1 synchronization started for all LVs")
+    print(f"[*] Checking sync status...")
 
-        # 8. Remove origin PV from VG
-        print(f"[*] Removing origin PV {origin} from VG...")
-        subprocess.run(['sudo', 'vgreduce', vg_name, origin], check=True, capture_output=True)
+    try:
+        result = subprocess.run(['sudo', 'lvs', '-a', '-o', 'lv_name,copy_percent', vg_name],
+                               capture_output=True, text=True)
+        print(result.stdout)
+    except:
+        pass
 
-        print(f"[SUCCESS] VG {vg_name} now runs on mirror device {mirror_device}")
-
-    except subprocess.CalledProcessError as e:
-        print(f"[!] LVM migration failed: {e}")
-        if e.stderr:
-            print(f"[!] Error: {e.stderr}")
-        return False
-
-    # 9. Resolve persistent paths for database
-    p_orig = utils.get_persistent_path(origin)
-    p_dest = utils.get_persistent_path(dest)
-    p_m_orig = utils.get_persistent_path(meta_orig)
-    p_m_dest = utils.get_persistent_path(meta_dest)
-
-    # 10. Create initramfs hook (for future boots)
-    print(f"\n[*] Creating initramfs hook for boot-time assembly...")
-    img_path = utils.inject_lvm_assembly_hook(
-        name, p_orig, p_dest, p_m_orig, p_m_dest,
-        vg_name
-    )
-    if not img_path:
-        print("[!] WARNING: Initramfs hook creation failed")
-        print("[!] System is running on mirror but may not boot correctly")
-
-    # 11. Detect root LV filesystem for database
+    # 7. Get root LV info for database
     root_lv = None
-    for lv in lvm_info['lvs']:
+    for lv in lvs:
         try:
             mount_output = subprocess.check_output(
                 ['findmnt', '-n', '-o', 'SOURCE', '/'],
                 text=True
             ).strip()
-            if lv['lv_path'] in mount_output:
+            if lv['lv_path'] in mount_output or lv['lv_name'] in mount_output:
                 root_lv = lv
                 break
         except:
             pass
 
     if not root_lv:
-        print("[!] Could not identify root LV")
-        root_lv = {'lv_name': 'unknown'}
+        root_lv = {'lv_name': lvs[0]['lv_name'] if lvs else 'unknown'}
 
     # Get filesystem type
     try:
@@ -460,48 +453,49 @@ def prepare_root_lvm(engine, name, origin, dest, meta_orig, meta_dest):
         current_fstype = fs_info[0]
         current_fsflags = fs_info[1]
     except Exception as e:
-        print(f"[!] Could not detect filesystem info: {e}")
         current_fstype = 'xfs'
         current_fsflags = 'defaults'
 
-    # 12. Record migration in database
-    print("[*] Updating migration database...")
+    # 8. Record migration in database (simpler - no metadata devices)
+    print(f"\n[*] Updating migration database...")
+    p_orig = utils.get_persistent_path(origin)
+    p_dest = utils.get_persistent_path(dest)
+
     database.record_migration(
         name=name,
         orig=p_orig,
         dest=p_dest,
-        meta_orig=p_m_orig,
-        meta_dest=p_m_dest,
+        meta_orig='',  # Not used for LVM RAID
+        meta_dest='',  # Not used for LVM RAID
         throttle=0,
         fstype=current_fstype,
         fsflags=current_fsflags
     )
 
-    # 13. Create Boom boot entry (for boot verification)
-    if img_path and not engine.setup_boom_entry(img_path, current_fstype, current_fsflags):
-        print("[!] WARNING: Boom boot entry creation failed")
-
+    # 9. Success summary
     print(f"\n{'='*60}")
-    print(f"[SUCCESS] LIVE LVM migration complete!")
+    print(f"[SUCCESS] LVM RAID1 migration complete!")
     print(f"{'='*60}")
     print(f"[*] Volume Group: {vg_name}")
-    print(f"[*] Root LV: {root_lv['lv_name']}")
-    print(f"[*] Mirror device: {mirror_device}")
+    print(f"[*] Converted LVs: {', '.join(converted_lvs)}")
+    print(f"[*] Origin PV: {origin}")
+    print(f"[*] Mirror PV: {dest}")
     print(f"")
     print(f"[*] Current status:")
-    print(f"    - System is RUNNING on the mirror")
-    print(f"    - Root filesystem is on /dev/mapper/{name} (via LVM)")
-    print(f"    - NO REBOOT REQUIRED for migration")
+    print(f"    - All LVs are now RAID1 mirrored")
+    print(f"    - System is RUNNING on mirrored volumes")
+    print(f"    - Sync in progress (check with: lvs -a -o +devices,copy_percent)")
+    print(f"    - NO REBOOT REQUIRED")
+    print(f"    - NO INITRAMFS HOOKS NEEDED (LVM handles boot automatically)")
     print(f"")
-    print(f"[*] RAID sync in progress:")
-    status, pct = engine.get_status()
-    print(f"    - Progress: {pct}")
-    print(f"    - Monitor: ./las.py status --name {name}")
+    print(f"[*] Monitor sync progress:")
+    print(f"    sudo lvs -a -o lv_name,copy_percent {vg_name}")
     print(f"")
     print(f"[*] Next steps:")
-    print(f"    1. Wait for sync to complete (100%)")
-    print(f"    2. Optionally reboot to verify boot path: grub2-reboot 'LAS-{name}' && reboot")
-    print(f"    3. When ready, finalize: ./las.py break --name {name} --commit")
+    print(f"    1. Wait for sync to complete (100.00%)")
+    print(f"    2. Optionally test reboot (mirror boots automatically)")
+    print(f"    3. When ready, finalize: ./las.py break --name {name}")
+    print(f"       (This removes origin PV, keeping only mirror)")
     print(f"{'='*60}")
 
     return True
@@ -516,10 +510,10 @@ def main():
     # --- Shared Arguments Helper ---
     def add_common_args(p):
         p.add_argument('--name', default='migration', help='Unique name for the migration')
-        p.add_argument('--orig', required=True, help='Source partition')
-        p.add_argument('--dest', required=True, help='Destination partition')
-        p.add_argument('--meta-orig', required=True, help='Source metadata partition')
-        p.add_argument('--meta-dest', required=True, help='Destination metadata partition')
+        p.add_argument('--orig', required=True, help='Source partition or LVM PV')
+        p.add_argument('--dest', required=True, help='Destination partition or LVM PV')
+        p.add_argument('--meta-orig', help='Source metadata partition (required for partition-based, not used for LVM)')
+        p.add_argument('--meta-dest', help='Destination metadata partition (required for partition-based, not used for LVM)')
 
     # --- 1. Command: activate ---
     act = subparsers.add_parser('activate', help='Adopt LUNs into a live mirror')
@@ -613,13 +607,21 @@ def main():
         lvm_info = utils.detect_lvm_info(args.orig)
 
         if lvm_info and lvm_info['is_pv']:
+            # LVM migration - uses native RAID1, no metadata devices needed
             print(f"[*] Detected LVM Physical Volume on {args.orig}")
             print(f"[*] VG: {lvm_info['vg_name']}, LVs: {len(lvm_info['lvs'])}")
-            print(f"[*] Using LIVE migration (no immediate reboot required)")
-            prepare_root_lvm(engine, args.name, args.orig, args.dest, args.meta_orig, args.meta_dest)
+            print(f"[*] Using LVM native RAID1 (no metadata devices needed)")
+            if args.meta_orig or args.meta_dest:
+                print(f"[*] Note: --meta-orig and --meta-dest ignored for LVM migrations")
+            prepare_root_lvm(engine, args.name, args.orig, args.dest)
         else:
+            # Partition-based migration - requires metadata devices
             print(f"[*] Detected partition-based device on {args.orig}")
-            print(f"[*] Using boot-time migration (reboot required)")
+            print(f"[*] Using dm-raid migration (requires metadata devices)")
+            if not args.meta_orig or not args.meta_dest:
+                print(f"[!] ERROR: Partition-based migrations require --meta-orig and --meta-dest")
+                print(f"[!] These devices store RAID metadata (minimum 1MB each)")
+                sys.exit(1)
             prepare_root(engine, args.name, args.orig, args.dest, args.meta_orig, args.meta_dest)
 
     elif args.command == 'activate':
@@ -641,43 +643,129 @@ def main():
         if not rec:
             print("[!] No record found."); sys.exit(1)
 
-        _, pct = engine.get_status()
-        if "100.00%" not in pct:
-            if input(f"[!] Sync incomplete ({pct}). Finalize anyway? (y/N): ").lower() != 'y': sys.exit(0)
+        # Detect if LVM or partition-based migration
+        # LVM migrations have empty meta_orig/meta_dest
+        is_lvm = not rec.get('meta_orig') or rec['meta_orig'] == ''
 
-        engine.cleanup_boom_entry()
-        engine.stop()
-
-        # If --commit flag is set, regenerate UUID on origin to prevent conflicts
-        if args.commit:
-            print(f"\n[*] Committing migration: regenerating origin UUID...")
+        if is_lvm:
+            # LVM RAID1 break - remove origin leg
+            print(f"[*] Detected LVM RAID1 migration")
             origin_dev = rec['orig']
-            fstype = rec.get('fstype', 'xfs')  # Default to xfs if not in DB
 
-            # Convert persistent path back to /dev/sdXN if needed
-            # (UUID tools work on actual device paths)
+            # Resolve persistent path
             if origin_dev.startswith('/dev/disk/by-id/'):
                 try:
-                    actual_dev = os.path.realpath(origin_dev)
-                    print(f"[*] Origin device: {origin_dev} -> {actual_dev}")
-                    origin_dev = actual_dev
+                    origin_dev = os.path.realpath(origin_dev)
                 except Exception as e:
                     print(f"[!] Warning: Could not resolve device path: {e}")
 
-            # Detect if LVM or partition-based
+            # Detect LVM info
             lvm_info = utils.detect_lvm_info(origin_dev)
+            if not lvm_info:
+                print(f"[!] Could not detect LVM info for {origin_dev}")
+                sys.exit(1)
 
-            if lvm_info and lvm_info['is_pv']:
-                # LVM: regenerate PV UUID
-                print(f"[*] Detected LVM Physical Volume")
-                if not utils.regenerate_pv_uuid(origin_dev):
-                    print("[!] WARNING: Failed to regenerate PV UUID")
-                    print("[!] Manual intervention may be needed to prevent UUID conflicts")
-                else:
-                    print(f"[*] Origin PV {origin_dev} now has a unique UUID")
-                    print(f"[*] Destination PV has taken over with the original UUID")
-            else:
-                # Partition-based: regenerate filesystem UUID
+            vg_name = lvm_info['vg_name']
+            lvs = lvm_info['lvs']
+
+            # Check sync status
+            print(f"[*] Checking RAID sync status...")
+            try:
+                result = subprocess.run(['sudo', 'lvs', '-o', 'lv_name,copy_percent', '--noheadings', vg_name],
+                                       capture_output=True, text=True)
+                print(result.stdout)
+
+                # Parse to see if any LV is not 100%
+                incomplete = False
+                for line in result.stdout.strip().split('\n'):
+                    if line.strip() and '100.00' not in line:
+                        incomplete = True
+                        break
+
+                if incomplete:
+                    if input(f"[!] Sync incomplete. Finalize anyway? (y/N): ").lower() != 'y':
+                        sys.exit(0)
+            except:
+                print(f"[!] Could not check sync status")
+                if input(f"[!] Continue anyway? (y/N): ").lower() != 'y':
+                    sys.exit(0)
+
+            # Remove origin leg from RAID1 (converts back to linear on dest)
+            print(f"\n[*] Removing origin PV from RAID1 mirrors...")
+            failed_lvs = []
+
+            for lv in lvs:
+                lv_name = lv['lv_name']
+                print(f"[*] Converting {lv_name} to linear (removing origin leg)...")
+                try:
+                    # lvconvert -m 0 removes mirrors, keeping only one leg
+                    # We specify origin_dev so it removes that leg specifically
+                    result = subprocess.run([
+                        'sudo', 'lvconvert', '-m', '0',
+                        f'/dev/{vg_name}/{lv_name}', origin_dev
+                    ], capture_output=True, text=True, input='y\n')
+
+                    if result.returncode != 0:
+                        print(f"[!] Failed to convert {lv_name}: {result.stderr}")
+                        failed_lvs.append(lv_name)
+                    else:
+                        print(f"[SUCCESS] {lv_name} converted to linear")
+                except Exception as e:
+                    print(f"[!] Error converting {lv_name}: {e}")
+                    failed_lvs.append(lv_name)
+
+            if failed_lvs:
+                print(f"\n[!] WARNING: Failed to convert some LVs: {', '.join(failed_lvs)}")
+                print(f"[!] Manual intervention may be required")
+
+            # Remove origin PV from VG
+            print(f"\n[*] Removing origin PV {origin_dev} from VG {vg_name}...")
+            try:
+                subprocess.run(['sudo', 'vgreduce', vg_name, origin_dev], check=True, capture_output=True)
+                print(f"[SUCCESS] Origin PV removed from VG")
+
+                # Optionally remove PV metadata
+                if args.commit:
+                    print(f"[*] Removing PV metadata from {origin_dev}...")
+                    subprocess.run(['sudo', 'pvremove', origin_dev], check=True, capture_output=True)
+                    print(f"[SUCCESS] PV metadata removed - disk can be reused")
+            except subprocess.CalledProcessError as e:
+                print(f"[!] Failed to remove origin PV: {e}")
+                print(f"[!] Manual cleanup may be needed: vgreduce {vg_name} {origin_dev}")
+
+            database.delete_migration(args.name)
+            print(f"\n[SUCCESS] LVM RAID1 migration finalized")
+            print(f"[*] All LVs now run on destination only")
+            print(f"[*] Origin disk {origin_dev} has been removed from VG")
+
+        else:
+            # Partition-based migration - existing logic
+            print(f"[*] Detected partition-based migration")
+
+            _, pct = engine.get_status()
+            if "100.00%" not in pct:
+                if input(f"[!] Sync incomplete ({pct}). Finalize anyway? (y/N): ").lower() != 'y':
+                    sys.exit(0)
+
+            engine.cleanup_boom_entry()
+            engine.stop()
+
+            # If --commit flag is set, regenerate UUID on origin to prevent conflicts
+            if args.commit:
+                print(f"\n[*] Committing migration: regenerating origin UUID...")
+                origin_dev = rec['orig']
+                fstype = rec.get('fstype', 'xfs')
+
+                # Convert persistent path back to /dev/sdXN if needed
+                if origin_dev.startswith('/dev/disk/by-id/'):
+                    try:
+                        actual_dev = os.path.realpath(origin_dev)
+                        print(f"[*] Origin device: {origin_dev} -> {actual_dev}")
+                        origin_dev = actual_dev
+                    except Exception as e:
+                        print(f"[!] Warning: Could not resolve device path: {e}")
+
+                # Regenerate filesystem UUID
                 if not utils.regenerate_filesystem_uuid(origin_dev, fstype):
                     print("[!] WARNING: Failed to regenerate origin UUID")
                     print("[!] Manual intervention may be needed to prevent UUID conflicts")
@@ -685,8 +773,8 @@ def main():
                     print(f"[*] Origin disk {origin_dev} now has a unique UUID")
                     print(f"[*] Destination disk has taken over with the original UUID")
 
-        database.delete_migration(args.name)
-        print("[SUCCESS] Finalized.")
+            database.delete_migration(args.name)
+            print("[SUCCESS] Partition migration finalized.")
 
 if __name__ == "__main__":
     main()
