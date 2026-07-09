@@ -184,18 +184,21 @@ def write_dm_raid_superblock(meta_dev, origin_dev_sz):
     final_header = header_data + struct.pack("<I", header_crc)
 
     try:
-        # Open in binary mode with direct synchronization
+        # Prepare a 4KB aligned buffer (required for O_DIRECT)
+        buffer = bytearray(4096)
+        buffer[:len(final_header)] = final_header
+        # Rest of buffer is already zeros from bytearray initialization
+
+        # Open with O_DIRECT for unbuffered I/O
         fd = os.open(meta_dev, os.O_WRONLY | os.O_DIRECT | os.O_SYNC)
-        with os.fdopen(fd, "wb") as f:
-            # Write the header at the very beginning of the device
-            f.write(final_header)
-            
-            # Pad the rest of the first 4KB sector with zeros
-            padding = 4096 - len(final_header)
-            f.write(b'\x00' * padding)
-            
-            f.flush()
-            os.fsync(f.fileno())
+        try:
+            # Write the 4KB-aligned buffer directly
+            bytes_written = os.write(fd, bytes(buffer))
+            if bytes_written != 4096:
+                raise IOError(f"Incomplete write: {bytes_written}/4096 bytes")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
         print(f"[SUCCESS] RAID Superblock written to {meta_dev} (Leg 0)")
 
