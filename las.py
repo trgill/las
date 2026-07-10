@@ -217,12 +217,22 @@ def show_status(name):
     else:
         # Check if the RAID device actually exists even if we aren't booted to it
         raid_exists = os.path.exists(f"/dev/mapper/{name}")
-        
+
         if raid_exists:
             print("   dm-raid active.")
         else:
-            print("👉 STATUS: No active migration found in the kernel.")
-            print("   Run 'las prepare' to begin a new migration.")
+            # Check if there's a prepared boom entry waiting
+            rec = database.get_migration(name)
+            boom_check = subprocess.run(['sudo', 'boom', 'entry', 'list'], capture_output=True, text=True)
+            # Check for boot entry with /dev/mapper/{name} root device
+            has_boom_entry = boom_check.returncode == 0 and f'/dev/mapper/{name}' in boom_check.stdout
+
+            if rec and has_boom_entry:
+                print("👉 STATUS: Migration prepared but not yet active.")
+                print(f"   Run 'sudo grub2-reboot \"LAS-{name}\" && sudo reboot' to activate.")
+            else:
+                print("👉 STATUS: No active migration found in the kernel.")
+                print("   Run 'las prepare-root' to begin a new migration.")
 
 
 def prepare_root(engine, name, origin, dest, meta_orig, meta_dest):
