@@ -209,7 +209,46 @@ if [ $MAPPED -eq 0 ]; then
     exit 1
 fi
 
-# 3. Final Announcement
+# 3. Update /etc/fstab on the root filesystem to use mapper devices
+# This prevents systemd from trying to mount old /dev/vdaX devices that are now RAID members
+echo "LAS: Updating /etc/fstab to use mapper devices..."
+
+# Mount root temporarily to update fstab
+TEMP_ROOT="/tmp/las_root_$$"
+mkdir -p "$TEMP_ROOT"
+
+if mount -o ro /dev/mapper/{name}3 "$TEMP_ROOT" 2>/dev/null; then
+    FSTAB="$TEMP_ROOT/etc/fstab"
+
+    if [ -f "$FSTAB" ]; then
+        # Remount read-write
+        mount -o remount,rw "$TEMP_ROOT"
+
+        # Backup original fstab
+        cp "$FSTAB" "${{FSTAB}}.pre-las-$(date +%Y%m%d)"
+
+        # Replace device references with mapper devices
+        sed -i 's|/dev/vda1|/dev/mapper/{name}1|g' "$FSTAB"
+        sed -i 's|/dev/vda2|/dev/mapper/{name}2|g' "$FSTAB"
+        sed -i 's|/dev/vda3|/dev/mapper/{name}3|g' "$FSTAB"
+
+        echo "LAS: Updated /etc/fstab:"
+        grep -v '^#' "$FSTAB" | grep -v '^$' || true
+
+        # Sync and unmount
+        sync
+        umount "$TEMP_ROOT"
+    else
+        echo "LAS: WARNING - /etc/fstab not found in root filesystem"
+        umount "$TEMP_ROOT"
+    fi
+else
+    echo "LAS: WARNING - Could not mount root to update fstab"
+fi
+
+rm -rf "$TEMP_ROOT"
+
+# 4. Final Announcement
 udevadm trigger --action=add /dev/mapper/{name}* || true
 udevadm settle --timeout=10
 echo "LAS: Mapper hierarchy ready. Recovery running in background at {rate} KiB/s."
