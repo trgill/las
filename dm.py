@@ -125,46 +125,25 @@ class RAIDEngine:
             print(f"[!] Mount scan error: {e}")
             return False
 
+        # NOTE: systemd.mount-extra is disabled for migration boot
+        # During migration, /etc/fstab handles all mounts after root is mounted.
+        # Adding systemd.mount-extra causes conflicts with fstab entries and
+        # EBUSY errors when trying to mount partitions that are part of the RAID.
         mount_args = []
         boot_dev_display = "Unknown"
 
+        # Scan for boot device display purposes only
         for line in mount_data:
             parts = line.split(None, 3)
             if len(parts) < 4:
                 continue
             target, source, mnt_fstype, mnt_opts = parts
 
-            # SKIP ROOT: Boom handles this via root_device
-            if target == "/" or target == "/root":
-                continue
-
-            source = source.replace(']', '').replace('[', '').strip()
-            if not source.startswith('/dev/'):
-                continue
-
-            dev_str = source
-
             if target == "/boot":
                 part_match = re.search(r'(\d+)', source)
                 idx = part_match.group(1) if part_match else "2"
-                dev_str = f"/dev/mapper/{clean_name}{separator}{idx}"
-                boot_dev_display = dev_str
-
-            elif target == "/home":
-                part_match = re.search(r'(\d+)', source)
-                idx = part_match.group(1) if part_match else root_idx
-                dev_str = f"/dev/mapper/{clean_name}{separator}{idx}"
-
-                # Update options to include explicit device pointer for Btrfs
-                if "subvol=" not in mnt_opts:
-                    clean_opts = re.sub(r'subvolid=\d+', '', mnt_opts)
-                    mnt_opts = f"{clean_opts.strip(',')},subvol=/home"
-                mnt_opts = f"{mnt_opts},device={dev_str}"
-
-            # Build the mount-extra string
-            clean_opts = mnt_opts.replace(",seclabel", "").replace("zstd:1", "zstd")
-            final_opts = f"{clean_opts.replace(',,', ',').strip(',')},{migration_opts}"
-            mount_args.append(f"systemd.mount-extra={dev_str}:{target}:{mnt_fstype}:{final_opts}")
+                boot_dev_display = f"/dev/mapper/{clean_name}{separator}{idx}"
+                break
 
         # 4. Finalize Kernel Options
         kver = subprocess.check_output(['uname', '-r'], text=True).strip()
