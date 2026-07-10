@@ -210,8 +210,12 @@ if [ $MAPPED -eq 0 ]; then
 fi
 
 # 3. Update /etc/fstab on the root filesystem to use mapper devices
-# This prevents systemd from trying to mount old /dev/vdaX devices that are now RAID members
+# This prevents systemd from trying to mount old device partitions that are now RAID members
 echo "LAS: Updating /etc/fstab to use mapper devices..."
+
+# Resolve the persistent path to actual device name (e.g., /dev/disk/by-path/... -> /dev/sda)
+ORIGIN_DEV=$(readlink -f {p_orig} | sed 's/[0-9]*$//')
+echo "LAS: Origin disk: $ORIGIN_DEV"
 
 # Mount root temporarily to update fstab
 TEMP_ROOT="/tmp/las_root_$$"
@@ -227,10 +231,20 @@ if mount -o ro /dev/mapper/{name}3 "$TEMP_ROOT" 2>/dev/null; then
         # Backup original fstab
         cp "$FSTAB" "${{FSTAB}}.pre-las-$(date +%Y%m%d)"
 
-        # Replace device references with mapper devices
-        sed -i 's|/dev/vda1|/dev/mapper/{name}1|g' "$FSTAB"
-        sed -i 's|/dev/vda2|/dev/mapper/{name}2|g' "$FSTAB"
-        sed -i 's|/dev/vda3|/dev/mapper/{name}3|g' "$FSTAB"
+        # Replace all partition references on the origin disk with mapper devices
+        # Works for /dev/sda1, /dev/vda1, /dev/nvme0n1p1, etc.
+        # Match the origin device followed by partition number, replace with mapper equivalent
+        ORIGIN_BASE=$(basename "$ORIGIN_DEV")
+
+        # Handle standard naming (sda, vda, hda, xvda)
+        sed -i "s|${{ORIGIN_DEV}}1|/dev/mapper/{name}1|g" "$FSTAB"
+        sed -i "s|${{ORIGIN_DEV}}2|/dev/mapper/{name}2|g" "$FSTAB"
+        sed -i "s|${{ORIGIN_DEV}}3|/dev/mapper/{name}3|g" "$FSTAB"
+
+        # Handle NVMe naming (nvme0n1p1)
+        sed -i "s|${{ORIGIN_DEV}}p1|/dev/mapper/{name}1|g" "$FSTAB"
+        sed -i "s|${{ORIGIN_DEV}}p2|/dev/mapper/{name}2|g" "$FSTAB"
+        sed -i "s|${{ORIGIN_DEV}}p3|/dev/mapper/{name}3|g" "$FSTAB"
 
         echo "LAS: Updated /etc/fstab:"
         grep -v '^#' "$FSTAB" | grep -v '^$' || true
