@@ -97,38 +97,26 @@ def inject_las_assembly_hook(name, p_orig, p_dest, p_m_orig, p_m_dest, partition
 
         return '\n\n'.join(mapping_lines)
 
-    # Generate partition mappings based on whether we have partition data
-    if partitions:
-        # NEW: Dynamic partition mapping
-        partition_map_commands = generate_partition_mappings(name, partitions)
-        print(f"[*] Using dynamic partition mapping for {len(partitions)} partitions")
-    else:
-        # LEGACY: Hardcoded partition mapping (for backward compatibility)
-        print("[!] Warning: Using legacy hardcoded partition offsets")
-        partition_map_commands = f"""# {name}1: BIOS Boot (Size 2048, Offset 2048)
-if echo "0 2048 linear /dev/mapper/{name} 2048" | dmsetup create {name}1; then
-    MAPPED=$((MAPPED + 1))
-else
-    echo "LAS: Warning - failed to map partition 1"
-    FAILED=$((FAILED + 1))
-fi
+    # If partitions weren't provided, parse them from the origin device
+    if not partitions:
+        print(f"[*] Partition data not provided, parsing from {p_orig}")
+        # Resolve persistent path to actual device
+        import subprocess as sp
+        actual_dev = sp.check_output(['readlink', '-f', p_orig], text=True).strip()
+        # Remove partition number if present (e.g., /dev/sda1 -> /dev/sda)
+        import re
+        base_dev = re.sub(r'[0-9]+$', '', actual_dev)
+        base_dev = re.sub(r'p[0-9]+$', '', base_dev)  # Handle nvme0n1p1 -> nvme0n1
 
-# {name}2: /boot (Size 4194304, Offset 4096)
-if echo "0 4194304 linear /dev/mapper/{name} 4096" | dmsetup create {name}2; then
-    MAPPED=$((MAPPED + 1))
-else
-    echo "LAS: Warning - failed to map partition 2"
-    FAILED=$((FAILED + 1))
-fi
+        partitions = parse_partition_table(base_dev)
+        if not partitions:
+            print(f"[!] ERROR: Could not parse partition table from {base_dev}")
+            print(f"[!] Cannot proceed without partition information")
+            return None
 
-# {name}3: / (The rest, starting at 4198400)
-ROOT_SIZE=$((SIZE - 4198400))
-if echo "0 $ROOT_SIZE linear /dev/mapper/{name} 4198400" | dmsetup create {name}3; then
-    MAPPED=$((MAPPED + 1))
-else
-    echo "LAS: Warning - failed to map partition 3"
-    FAILED=$((FAILED + 1))
-fi"""
+    # Generate dynamic partition mappings
+    partition_map_commands = generate_partition_mappings(name, partitions)
+    print(f"[*] Using dynamic partition mapping for {len(partitions)} partitions")
 
     hook_content = f"""#!/bin/sh
 # LAS Dynamic Assembly Hook
