@@ -184,9 +184,22 @@ if ! echo "$TABLE" | dmsetup create {name}; then
     exit 1
 fi
 
-# Verify RAID device appeared
-if [ ! -e "/dev/mapper/{name}" ]; then
-    echo "LAS: ERROR - RAID device did not appear"
+# Verify RAID device appeared and wait for it to be ready
+echo "LAS: Waiting for /dev/mapper/{name} to become ready..."
+i=0
+while [ $i -lt 30 ]; do
+    if [ -b "/dev/mapper/{name}" ]; then
+        echo "LAS: RAID device /dev/mapper/{name} is ready"
+        break
+    fi
+    sleep 1
+    i=$((i+1))
+done
+
+if [ ! -b "/dev/mapper/{name}" ]; then
+    echo "LAS: ERROR - RAID device did not appear as a block device"
+    dmsetup ls || true
+    ls -la /dev/mapper/ || true
     exit 1
 fi
 
