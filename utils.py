@@ -105,7 +105,7 @@ def inject_las_assembly_hook(name, p_orig, p_dest, p_m_orig, p_m_dest, partition
     else:
         # LEGACY: Hardcoded partition mapping (for backward compatibility)
         print("[!] Warning: Using legacy hardcoded partition offsets")
-        partition_map_commands = """# migration1: BIOS Boot (Size 2048, Offset 2048)
+        partition_map_commands = f"""# {name}1: BIOS Boot (Size 2048, Offset 2048)
 if echo "0 2048 linear /dev/mapper/{name} 2048" | dmsetup create {name}1; then
     MAPPED=$((MAPPED + 1))
 else
@@ -113,7 +113,7 @@ else
     FAILED=$((FAILED + 1))
 fi
 
-# migration2: /boot (Size 4194304, Offset 4096)
+# {name}2: /boot (Size 4194304, Offset 4096)
 if echo "0 4194304 linear /dev/mapper/{name} 4096" | dmsetup create {name}2; then
     MAPPED=$((MAPPED + 1))
 else
@@ -121,7 +121,7 @@ else
     FAILED=$((FAILED + 1))
 fi
 
-# migration3: / (The rest, starting at 4198400)
+# {name}3: / (The rest, starting at 4198400)
 ROOT_SIZE=$((SIZE - 4198400))
 if echo "0 $ROOT_SIZE linear /dev/mapper/{name} 4198400" | dmsetup create {name}3; then
     MAPPED=$((MAPPED + 1))
