@@ -234,7 +234,7 @@ echo "LAS: RAID device: /dev/mapper/{name} with $MAPPED partition(s)"
             'sudo', 'dracut', '--force',
             '--add', 'dm',
             '--add-drivers', 'dm-raid raid1',
-            '--install', 'dmsetup blockdev udevadm btrfs partx',
+            '--install', 'dmsetup blockdev udevadm btrfs partx lsblk',
             '--include', tmp_hook_path, f'/usr/lib/dracut/hooks/pre-mount/{hook_filename}',
             migration_img, kver
         ]
@@ -378,6 +378,8 @@ echo "LAS-LVM: Volume Group {vg_name} ready. Recovery running at {rate} KiB/s."
         "dracut",
         "--force",
         "--add", "lvm",  # Include LVM dracut module
+        "--add", "dm",   # Include device-mapper module
+        "--install", "lsblk dmsetup",  # Include diagnostic and dm tools
         "--include", hook_path, f"/usr/lib/dracut/hooks/pre-mount/{hook_name}",
         img_path,
         kver
