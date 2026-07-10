@@ -280,6 +280,9 @@ class RAIDEngine:
 
             # Use boom CLI to create boot entry
             # Use -p with the profile hash ID
+            # Note: Use --add-opts instead of --options because the profile has
+            # a template that sets base options. --options would override the template,
+            # but boom ignores it. --add-opts appends to the template.
             boom_cmd = [
                 "boom", "create",
                 "--title", f"LAS-{clean_name}",
@@ -287,7 +290,7 @@ class RAIDEngine:
                 "--boot-dir", "/boot",
                 "-i", final_img_path,
                 "-l", final_kern_path,
-                "--options", all_opts,
+                "--add-opts", all_opts,  # Add to profile template, don't replace
                 "--no-dev",
                 "-p", profile_hash  # Use OS profile hash ID
             ]
