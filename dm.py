@@ -209,31 +209,105 @@ class RAIDEngine:
         final_kern_path = final_kern_path.replace("//", "/")
 
         try:
-            # We add --boot-dir to force boom to write to the physical mount
-            # We add --no-dev because /dev/mapper/migration1 isn't active yet
+            # Detect OS information from /etc/os-release
+            os_id = "fedora"
+            os_version = "43"
+            os_name = "Fedora Linux"
+            try:
+                with open('/etc/os-release', 'r') as f:
+                    for line in f:
+                        if line.startswith('ID='):
+                            os_id = line.split('=')[1].strip().strip('"')
+                        elif line.startswith('VERSION_ID='):
+                            os_version = line.split('=')[1].strip().strip('"')
+                        elif line.startswith('NAME='):
+                            os_name = line.split('=')[1].strip().strip('"')
+            except:
+                pass  # Use defaults
+
+            # Get or create OS profile and extract its hash ID
+            profile_check = subprocess.run(
+                ['boom', 'profile', 'list'],
+                capture_output=True, text=True
+            )
+
+            # Parse profile list to find matching profile by name and version
+            profile_hash = None
+            if profile_check.returncode == 0:
+                for line in profile_check.stdout.splitlines():
+                    if os_name in line and os_version in line:
+                        # Extract hash from first column
+                        parts = line.split()
+                        if parts:
+                            profile_hash = parts[0]
+                            print(f"[*] Found existing profile: {profile_hash}")
+                            break
+
+            if not profile_hash:
+                # Create a minimal OS profile using correct boom syntax
+                print(f"[*] Creating boom OS profile for {os_name} {os_version}")
+                create_profile = subprocess.run([
+                    'boom', 'profile', 'create',
+                    '-n', os_name,  # OS name
+                    '-s', os_id,  # Short name
+                    '--os-version', os_version,  # OS version
+                    '-I', os_version,  # OS version ID
+                    '-k', '/vmlinuz-%{version}',  # Kernel pattern
+                    '-R', '/initramfs-%{version}.img',  # Initramfs pattern
+                    '-u', r'%{version}'  # Uname pattern
+                ], capture_output=True, text=True)
+
+                if create_profile.returncode != 0:
+                    error_out = create_profile.stderr.strip() or create_profile.stdout.strip() or "Unknown error"
+                    print(f"[!] Warning: Could not create profile: {error_out}")
+                    return False
+                else:
+                    print(f"[*] Profile created successfully")
+                    # Get the newly created profile hash
+                    recheck = subprocess.run(['boom', 'profile', 'list'], capture_output=True, text=True)
+                    if recheck.returncode == 0:
+                        for line in recheck.stdout.splitlines():
+                            if os_name in line and os_version in line:
+                                parts = line.split()
+                                if parts:
+                                    profile_hash = parts[0]
+                                    print(f"[*] Profile hash: {profile_hash}")
+                                    break
+
+            if not profile_hash:
+                print(f"[!] Could not determine profile hash")
+                return False
+
+            # Use boom CLI to create boot entry
+            # Use -p with the profile hash ID
             boom_cmd = [
                 "boom", "create",
                 "--title", f"LAS-{clean_name}",
                 "--root-device", root_mapper,
-                "--boot-dir", "/boot",   # <--- THE CRITICAL ADDITION
-                "-i", final_img_path, 
+                "--boot-dir", "/boot",
+                "-i", final_img_path,
                 "-l", final_kern_path,
                 "--options", all_opts,
-                "--no-dev"
+                "--no-dev",
+                "-p", profile_hash  # Use OS profile hash ID
             ]
 
             result = subprocess.run(boom_cmd, capture_output=True, text=True)
-            
+
             if result.returncode == 0:
                 print(f"[SUCCESS] Boom entry 'LAS-{clean_name}' created.")
+                if result.stdout.strip():
+                    print(f"[*] Boom output: {result.stdout.strip()}")
                 return True
             else:
-                # This will tell us WHY it's failing to write the file
-                print(f"[!] Boom CLI error: {result.stderr.strip()}")
+                error_msg = result.stderr.strip() or result.stdout.strip() or "Unknown error"
+                print(f"[!] Boom CLI error: {error_msg}")
                 return False
 
         except Exception as e:
-            print(f"[!] Failed to invoke Boom CLI: {e}")
+            print(f"[!] Failed to create Boom entry: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
 

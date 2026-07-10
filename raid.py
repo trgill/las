@@ -10,6 +10,7 @@ import uuid
 import zlib
 import os
 import subprocess
+import mmap
 
 # DM-RAID Constants
 DM_RAID_MAGIC = 0x72616964  # 'raid' in ASCII (little-endian)
@@ -184,21 +185,30 @@ def write_dm_raid_superblock(meta_dev, origin_dev_sz):
     final_header = header_data + struct.pack("<I", header_crc)
 
     try:
-        # Prepare a 4KB aligned buffer (required for O_DIRECT)
-        buffer = bytearray(4096)
+        # O_DIRECT requires:
+        # 1. Buffer size aligned to block size (4096)
+        # 2. Buffer memory address aligned to page boundary
+        # 3. File offset aligned to block size (we write at offset 0, which is aligned)
+        #
+        # Using mmap with MAP_SHARED gives us a page-aligned memory buffer
+        # that satisfies O_DIRECT requirements
+
+        # Create a page-aligned buffer using mmap
+        buffer = mmap.mmap(-1, 4096, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
         buffer[:len(final_header)] = final_header
-        # Rest of buffer is already zeros from bytearray initialization
+        # Rest is already zeros from mmap initialization
 
         # Open with O_DIRECT for unbuffered I/O
         fd = os.open(meta_dev, os.O_WRONLY | os.O_DIRECT | os.O_SYNC)
         try:
-            # Write the 4KB-aligned buffer directly
-            bytes_written = os.write(fd, bytes(buffer))
+            # Write the page-aligned buffer directly
+            bytes_written = os.write(fd, buffer)
             if bytes_written != 4096:
                 raise IOError(f"Incomplete write: {bytes_written}/4096 bytes")
             os.fsync(fd)
         finally:
             os.close(fd)
+            buffer.close()
 
         print(f"[SUCCESS] RAID Superblock written to {meta_dev} (Leg 0)")
 
