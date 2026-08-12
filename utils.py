@@ -986,6 +986,23 @@ def validate_migration_geometry(source_dev, dest_dev, meta_orig, meta_dest):
     print("[OK] Geometry validation passed.")
     return True
 
+def sync_partition_table(src, dest):
+    """Copies the partition table from src to dest and fixes up GPT headers."""
+    print(f"[*] Syncing partition table from {src} to {dest}...")
+    try:
+        dump = subprocess.check_output(['sfdisk', '-d', src])
+        process = subprocess.Popen(['sfdisk', dest], stdin=subprocess.PIPE)
+        process.communicate(input=dump)
+
+        subprocess.run(['sgdisk', '-e', dest], check=True)
+        subprocess.run(['partprobe', dest], check=True)
+    except Exception as e:
+        print(f"[!] Failed to sync geometry: {e}")
+        return False
+    subprocess.run(['udevadm', 'settle'], check=False)
+    return True
+
+
 def parse_partition_table(device):
     """
     Parses partition table from device and returns partition geometry.
