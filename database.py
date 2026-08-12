@@ -25,30 +25,43 @@ def _get_conn():
 def init_db():
     """Creates the migration table if it doesn't already exist."""
     with _get_conn() as conn:
-        # Added fstype and fsflags to persist the mount environment
         conn.execute("""
             CREATE TABLE IF NOT EXISTS migrations (
                 name TEXT PRIMARY KEY,
                 orig TEXT NOT NULL,
                 dest TEXT NOT NULL,
-                meta_orig TEXT NOT NULL,
-                meta_dest TEXT NOT NULL,
+                meta_orig TEXT NOT NULL DEFAULT '',
+                meta_dest TEXT NOT NULL DEFAULT '',
                 fstype TEXT,
                 fsflags TEXT,
                 throttle INTEGER DEFAULT 0,
-                active INTEGER DEFAULT 0
+                active INTEGER DEFAULT 0,
+                migration_type TEXT DEFAULT 'partition'
             )
         """)
+        # Add migration_type column to existing databases
+        columns = [
+            row[1] for row in
+            conn.execute("PRAGMA table_info(migrations)").fetchall()
+        ]
+        if 'migration_type' not in columns:
+            conn.execute(
+                "ALTER TABLE migrations ADD COLUMN "
+                "migration_type TEXT DEFAULT 'partition'"
+            )
 
-def record_migration(name, orig, dest, meta_orig, meta_dest, throttle=0, fstype=None, fsflags=None):
+def record_migration(name, orig, dest, meta_orig, meta_dest, throttle=0,
+                     fstype=None, fsflags=None, migration_type='partition'):
     """Saves or updates a migration record including filesystem metadata."""
     init_db()
     with _get_conn() as conn:
         conn.execute("""
-            INSERT OR REPLACE INTO migrations 
-            (name, orig, dest, meta_orig, meta_dest, throttle, fstype, fsflags, active)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
-        """, (name, orig, dest, meta_orig, meta_dest, throttle, fstype, fsflags))
+            INSERT OR REPLACE INTO migrations
+            (name, orig, dest, meta_orig, meta_dest, throttle, fstype, fsflags,
+             active, migration_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+        """, (name, orig, dest, meta_orig, meta_dest, throttle, fstype,
+              fsflags, migration_type))
         conn.commit()
 
 def get_migration(name):
