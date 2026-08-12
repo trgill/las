@@ -187,6 +187,25 @@ class RAIDEngine:
         final_img_path = final_img_path.replace("//", "/")
         final_kern_path = final_kern_path.replace("//", "/")
 
+        # Verify kernel and initramfs exist before creating boot entry
+        kern_check = final_kern_path
+        img_check = img_path
+        if is_boot_separate:
+            kern_check = f"/boot{final_kern_path}"
+            img_check = img_path if img_path.startswith("/boot") else f"/boot{img_path}"
+
+        if not os.path.exists(kern_check):
+            print(f"[!] Kernel image not found: {kern_check}")
+            return False
+
+        if not os.path.exists(img_check):
+            print(f"[!] Initramfs image not found: {img_check}")
+            return False
+
+        print(f"[*] Verified kernel: {kern_check}")
+        print(f"[*] Verified initramfs: {img_check} "
+              f"({os.path.getsize(img_check) // (1024*1024)} MB)")
+
         try:
             # Detect OS information from /etc/os-release
             os_id = "fedora"
@@ -201,8 +220,8 @@ class RAIDEngine:
                             os_version = line.split('=')[1].strip().strip('"')
                         elif line.startswith('NAME='):
                             os_name = line.split('=')[1].strip().strip('"')
-            except:
-                pass  # Use defaults
+            except Exception:
+                pass
 
             # Get or create OS profile and extract its hash ID
             profile_check = subprocess.run(
