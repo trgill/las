@@ -81,6 +81,20 @@ class PartitionBackend(StorageBackend):
     def validate(self, origin, dest, *, meta_orig, meta_dest):
         return utils.validate_migration_geometry(origin, dest, meta_orig, meta_dest)
 
+    def _detect_root_partition_index(self):
+        """Detect which partition number the current root (/) lives on."""
+        import re
+        try:
+            root_src = subprocess.check_output(
+                ['findmnt', '-n', '-o', 'SOURCE', '/'], text=True
+            ).strip().split('[')[0]
+            match = re.search(r'(\d+)$', root_src)
+            if match:
+                return int(match.group(1))
+        except Exception as e:
+            print(f"[!] Could not detect root partition index: {e}")
+        return None
+
     def prepare(self, name, origin, dest, *, meta_orig, meta_dest):
         print(f"[*] Starting Lift and Shift (LAS) preparation for: {name}")
 
@@ -114,6 +128,19 @@ class PartitionBackend(StorageBackend):
             print(f"    Partition {part['num']}: start={part['start']}, "
                   f"size={part['size']} sectors ({size_gb:.2f} GB)")
 
+        root_part_num = self._detect_root_partition_index()
+        if root_part_num is not None:
+            part_nums = [p['num'] for p in partitions]
+            if root_part_num not in part_nums:
+                print(f"[!] Detected root partition {root_part_num} "
+                      f"not in partition table {part_nums}")
+                return False
+            print(f"[*] Root filesystem is on partition {root_part_num}")
+        else:
+            root_part_num = partitions[-1]['num']
+            print(f"[*] Could not auto-detect root partition, "
+                  f"assuming partition {root_part_num}")
+
         raid.wipe_metadata(meta_orig)
         if not raid.write_dm_raid_superblock(meta_orig, origin_sz):
             print("[!] Failed to prime source metadata.")
@@ -125,7 +152,8 @@ class PartitionBackend(StorageBackend):
         p_m_dest = utils.get_persistent_path(meta_dest)
 
         img_path = utils.inject_las_assembly_hook(
-            name, p_orig, p_dest, p_m_orig, p_m_dest, partitions
+            name, p_orig, p_dest, p_m_orig, p_m_dest, partitions,
+            root_part_num=root_part_num
         )
         if not img_path:
             return False

@@ -70,43 +70,57 @@ def get_persistent_path(dev_path):
                     return full_link
     return dev_path
 
-def inject_las_assembly_hook(name, p_orig, p_dest, p_m_orig, p_m_dest, partitions=None, throttle_kibs=3072):
-    # DEFAULT RATE: 3072 KiB/s (~3 MB/s)
-    # This balances boot responsiveness with reasonable sync speed.
+def inject_las_assembly_hook(name, p_orig, p_dest, p_m_orig, p_m_dest,
+                             partitions=None, root_part_num=None,
+                             throttle_kibs=3072):
     rate = throttle_kibs if throttle_kibs and throttle_kibs > 0 else 3072
     max_rate = rate * 10
 
-    # Helper function to generate dynamic partition mappings
     def generate_partition_mappings(name, partitions):
-        """Generate dmsetup linear mapping commands for all partitions."""
         mapping_lines = []
         for part in partitions:
             num = part['num']
             start = part['start']
             size = part['size']
-
-            # dmsetup create requires: "0 <size> linear <device> <offset>"
             mapping_lines.append(
+                f'log "Mapping partition {num}: offset={start}, size={size} sectors"\n'
                 f'if echo "0 {size} linear /dev/mapper/{name} {start}" | dmsetup create {name}{num}; then\n'
                 f'    MAPPED=$((MAPPED + 1))\n'
+                f'    log "Partition {num} mapped to /dev/mapper/{name}{num}"\n'
                 f'else\n'
-                f'    echo "LAS: Warning - failed to map partition {num}"\n'
+                f'    log "WARNING: failed to map partition {num}"\n'
                 f'    FAILED=$((FAILED + 1))\n'
                 f'fi'
             )
-
         return '\n\n'.join(mapping_lines)
 
-    # If partitions weren't provided, parse them from the origin device
+    def generate_cleanup_commands(name, partitions):
+        return '\n'.join(
+            f'    dmsetup remove {name}{part["num"]} 2>/dev/null || true'
+            for part in partitions
+        )
+
+    def generate_fstab_sed_commands(name, partitions):
+        lines = []
+        for part in partitions:
+            num = part['num']
+            lines.append(
+                f'        sed -i "s|${{ORIGIN_DEV}}{num}|/dev/mapper/{name}{num}|g" "$FSTAB"'
+            )
+            lines.append(
+                f'        sed -i "s|${{ORIGIN_DEV}}p{num}|/dev/mapper/{name}{num}|g" "$FSTAB"'
+            )
+        return '\n'.join(lines)
+
     if not partitions:
         print(f"[*] Partition data not provided, parsing from {p_orig}")
-        # Resolve persistent path to actual device
         import subprocess as sp
-        actual_dev = sp.check_output(['readlink', '-f', p_orig], text=True).strip()
-        # Remove partition number if present (e.g., /dev/sda1 -> /dev/sda)
+        actual_dev = sp.check_output(
+            ['readlink', '-f', p_orig], text=True
+        ).strip()
         import re
         base_dev = re.sub(r'[0-9]+$', '', actual_dev)
-        base_dev = re.sub(r'p[0-9]+$', '', base_dev)  # Handle nvme0n1p1 -> nvme0n1
+        base_dev = re.sub(r'p[0-9]+$', '', base_dev)
 
         partitions = parse_partition_table(base_dev)
         if not partitions:
@@ -114,165 +128,231 @@ def inject_las_assembly_hook(name, p_orig, p_dest, p_m_orig, p_m_dest, partition
             print(f"[!] Cannot proceed without partition information")
             return None
 
-    # Generate dynamic partition mappings
+    if root_part_num is None:
+        root_part_num = partitions[-1]['num']
+
     partition_map_commands = generate_partition_mappings(name, partitions)
-    print(f"[*] Using dynamic partition mapping for {len(partitions)} partitions")
+    cleanup_partition_removes = generate_cleanup_commands(name, partitions)
+    fstab_sed_block = generate_fstab_sed_commands(name, partitions)
+    partition_count = len(partitions)
+    print(f"[*] Using dynamic partition mapping for {partition_count} partitions "
+          f"(root=partition {root_part_num})")
 
     hook_content = f"""#!/bin/sh
 # LAS Dynamic Assembly Hook
 # Auto-generated for migration: {name}
+# Root partition: {root_part_num} | Partition count: {partition_count}
+# Source: {p_orig} -> Dest: {p_dest}
+# Meta:  {p_m_orig} / {p_m_dest}
 
-echo "LAS: Starting hardware discovery..."
+LAS_LOG="/run/las-assembly.log"
+ASSEMBLY_OK=0
+
+log() {{
+    echo "LAS: $1"
+    echo "LAS: $1" >> "$LAS_LOG" 2>/dev/null
+    echo "<6>LAS: $1" > /dev/kmsg 2>/dev/null || true
+}}
+
+dump_diagnostics() {{
+    log "=== Diagnostic dump ==="
+    log "Block devices:"
+    lsblk -o NAME,MAJ:MIN,SIZE,TYPE,MOUNTPOINT 2>&1 | while IFS= read -r _line; do log "  $_line"; done
+    log "Device mapper tables:"
+    dmsetup ls 2>&1 | while IFS= read -r _line; do log "  $_line"; done
+    log "Device IDs:"
+    blkid 2>&1 | while IFS= read -r _line; do log "  $_line"; done
+    log "/dev/mapper contents:"
+    ls -la /dev/mapper/ 2>&1 | while IFS= read -r _line; do log "  $_line"; done
+    log "=== End diagnostics ==="
+}}
+
+cleanup_on_failure() {{
+    log "Cleaning up stale dm devices..."
+{cleanup_partition_removes}
+    dmsetup remove {name} 2>/dev/null || true
+}}
+
+die() {{
+    log "FATAL: $1"
+    dump_diagnostics
+    cleanup_on_failure
+    log "========================================"
+    log "RECOVERY: Reboot into the original OS entry (not the LAS entry)"
+    log "RECOVERY: Then run: ./las.py revert --name {name}"
+    log "RECOVERY: Assembly log saved to $LAS_LOG (if initramfs is accessible)"
+    log "RECOVERY: Also check: dmesg | grep LAS"
+    log "========================================"
+    exit 1
+}}
+
+wait_for_device() {{
+    _wdev="$1"
+    _wlabel="$2"
+    _wtimeout=30
+    _wi=0
+    while [ $_wi -lt $_wtimeout ]; do
+        if [ -e "$_wdev" ]; then
+            log "$_wlabel ready: $_wdev"
+            return 0
+        fi
+        sleep 1
+        _wi=$((_wi+1))
+    done
+    log "$_wlabel NOT FOUND after ${{_wtimeout}}s: $_wdev"
+    return 1
+}}
+
+# Cleanup stale dm devices on unexpected exit
+trap 'if [ "$ASSEMBLY_OK" -ne 1 ]; then log "Unexpected exit - running cleanup"; cleanup_on_failure; fi' EXIT
+
+log "Starting LAS assembly for migration: {name}"
+log "Hook version: hardened"
 udevadm settle --timeout=30
 
-# Force kernel to forget physical Btrfs signatures to avoid conflicts
+# Prevent stale Btrfs signature conflicts
 /usr/sbin/btrfs device scan --forget 2>/dev/null || true
 
-# Wait for physical source
-i=0
-while [ $i -lt 15 ]; do
-    [ -e "{p_orig}" ] && break
-    sleep 1
-    i=$((i+1))
-done
+# Wait for ALL required devices
+log "Waiting for storage devices..."
+wait_for_device "{p_orig}" "Source data" || die "Source disk not found: {p_orig}"
+wait_for_device "{p_dest}" "Dest data" || die "Destination disk not found: {p_dest}"
+wait_for_device "{p_m_orig}" "Source metadata" || die "Source metadata device not found: {p_m_orig}"
+wait_for_device "{p_m_dest}" "Dest metadata" || die "Destination metadata device not found: {p_m_dest}"
 
-if [ ! -e "{p_orig}" ]; then
-    echo "LAS: ERROR - Source disk {p_orig} not found!"
-    exit 1
-fi
+# Hide physical partitions to prevent scanner conflicts
+log "Hiding physical partitions on source..."
+partx -d "{p_orig}" 2>/dev/null || log "partx not available, skipping partition hide"
 
-echo "LAS: Source device {p_orig} ready"
-
-# Prevent partition scanner conflicts
-echo "LAS: Hiding physical partitions..."
-partx -d {p_orig} 2>/dev/null || echo "LAS: partx not available, skipping partition hide"
-
-# Clean up any stale mapper devices
+# Remove stale mapper devices from a previous failed attempt
 if dmsetup info {name} >/dev/null 2>&1; then
-    echo "LAS: Removing stale {name}..."
-    dmsetup remove {name} 2>/dev/null || true
+    log "Removing stale RAID device from previous attempt..."
+    cleanup_on_failure
 fi
 
-# Flush buffers
-blockdev --flushbufs {p_orig} 2>/dev/null || true
+blockdev --flushbufs "{p_orig}" 2>/dev/null || true
 
-# Get disk size
-SIZE=$(blockdev --getsz {p_orig})
-echo "LAS: Disk size: $SIZE sectors"
+# Get and validate disk size
+SIZE=$(blockdev --getsz "{p_orig}" 2>/dev/null)
+if [ -z "$SIZE" ]; then
+    die "blockdev --getsz returned empty for {p_orig}"
+fi
+# Verify SIZE is a positive integer
+case "$SIZE" in
+    ''|*[!0-9]*) die "blockdev --getsz returned non-numeric value: '$SIZE'" ;;
+esac
+if [ "$SIZE" -le 0 ]; then
+    die "blockdev --getsz returned zero or negative: $SIZE"
+fi
+log "Source disk size: $SIZE sectors"
 
-# 1. Assemble the RAID Mirror
-# rebuild 1 triggers the sync, but our throttled 'rate' keeps it from hanging the boot.
+# Assemble the RAID1 mirror
 TABLE="0 $SIZE raid raid1 7 1024 rebuild 1 min_recovery_rate {rate} max_recovery_rate {max_rate} 2 {p_m_orig} {p_orig} {p_m_dest} {p_dest}"
-echo "LAS: Assembling /dev/mapper/{name}..."
+log "Creating RAID1 mirror /dev/mapper/{name}..."
+log "RAID table: $TABLE"
 if ! echo "$TABLE" | dmsetup create {name}; then
-    echo "LAS: ERROR - Failed to create RAID mirror"
-    echo "LAS: Diagnostic information:"
-    dmsetup ls || true
-    lsblk -o NAME,MAJ:MIN,SIZE,TYPE,MOUNTPOINT || true
-    exit 1
+    die "dmsetup create {name} failed"
 fi
 
-# Verify RAID device appeared and wait for it to be ready
-echo "LAS: Waiting for /dev/mapper/{name} to become ready..."
-i=0
-while [ $i -lt 30 ]; do
+# Wait for RAID block device to appear
+log "Waiting for /dev/mapper/{name} block device..."
+_ri=0
+while [ $_ri -lt 30 ]; do
     if [ -b "/dev/mapper/{name}" ]; then
-        echo "LAS: RAID device /dev/mapper/{name} is ready"
+        log "RAID device /dev/mapper/{name} is ready"
         break
     fi
     sleep 1
-    i=$((i+1))
+    _ri=$((_ri+1))
 done
 
 if [ ! -b "/dev/mapper/{name}" ]; then
-    echo "LAS: ERROR - RAID device did not appear as a block device"
-    dmsetup ls || true
-    ls -la /dev/mapper/ || true
-    exit 1
+    die "RAID device /dev/mapper/{name} did not appear as block device after 30s"
 fi
 
 udevadm settle --timeout=10
 
-# 2. Manually Map the Partitions
-# This bypasses partprobe issues by creating explicit linear targets
-# that match exactly what your 'las.py' expects.
-echo "LAS: Creating linear partition mappings..."
+# Verify RAID status
+_raid_status=$(dmsetup status {name} 2>/dev/null) || true
+log "RAID status: $_raid_status"
 
+# Map individual partitions via dm-linear
+log "Creating linear partition mappings for {partition_count} partitions..."
 MAPPED=0
 FAILED=0
 
 {partition_map_commands}
 
-echo "LAS: Mapped $MAPPED partitions ($FAILED failed)"
+log "Partition mapping complete: $MAPPED succeeded, $FAILED failed (of {partition_count} total)"
 
 if [ $MAPPED -eq 0 ]; then
-    echo "LAS: ERROR - No partitions were mapped successfully"
-    exit 1
+    die "No partitions were mapped successfully"
 fi
 
-# 3. Update /etc/fstab on the root filesystem to use mapper devices
-# This prevents systemd from trying to mount old device partitions that are now RAID members
-echo "LAS: Updating /etc/fstab to use mapper devices..."
+if [ $FAILED -gt 0 ]; then
+    log "WARNING: $FAILED partition(s) failed to map - boot may be degraded"
+fi
 
-# Resolve the persistent path to actual device name (e.g., /dev/disk/by-path/... -> /dev/sda)
-ORIGIN_DEV=$(readlink -f {p_orig} | sed 's/[0-9]*$//')
-echo "LAS: Origin disk: $ORIGIN_DEV"
+# Update /etc/fstab to reference mapper devices instead of physical partitions
+log "Updating /etc/fstab to use mapper devices..."
 
-# Mount root temporarily to update fstab
-TEMP_ROOT="/tmp/las_root_$$"
-mkdir -p "$TEMP_ROOT"
-
-if mount -o ro /dev/mapper/{name}3 "$TEMP_ROOT" 2>/dev/null; then
-    FSTAB="$TEMP_ROOT/etc/fstab"
-
-    if [ -f "$FSTAB" ]; then
-        # Remount read-write
-        mount -o remount,rw "$TEMP_ROOT"
-
-        # Backup original fstab
-        cp "$FSTAB" "${{FSTAB}}.pre-las-$(date +%Y%m%d)"
-
-        # Replace all partition references on the origin disk with mapper devices
-        # Works for /dev/sda1, /dev/vda1, /dev/nvme0n1p1, etc.
-        # Match the origin device followed by partition number, replace with mapper equivalent
-        ORIGIN_BASE=$(basename "$ORIGIN_DEV")
-
-        # Handle standard naming (sda, vda, hda, xvda)
-        sed -i "s|${{ORIGIN_DEV}}1|/dev/mapper/{name}1|g" "$FSTAB"
-        sed -i "s|${{ORIGIN_DEV}}2|/dev/mapper/{name}2|g" "$FSTAB"
-        sed -i "s|${{ORIGIN_DEV}}3|/dev/mapper/{name}3|g" "$FSTAB"
-
-        # Handle NVMe naming (nvme0n1p1)
-        sed -i "s|${{ORIGIN_DEV}}p1|/dev/mapper/{name}1|g" "$FSTAB"
-        sed -i "s|${{ORIGIN_DEV}}p2|/dev/mapper/{name}2|g" "$FSTAB"
-        sed -i "s|${{ORIGIN_DEV}}p3|/dev/mapper/{name}3|g" "$FSTAB"
-
-        echo "LAS: Updated /etc/fstab:"
-        grep -v '^#' "$FSTAB" | grep -v '^$' || true
-
-        # Sync and unmount
-        sync
-        umount "$TEMP_ROOT"
-    else
-        echo "LAS: WARNING - /etc/fstab not found in root filesystem"
-        umount "$TEMP_ROOT"
-    fi
+ORIGIN_DEV=$(readlink -f "{p_orig}" 2>/dev/null)
+if [ -z "$ORIGIN_DEV" ]; then
+    log "WARNING: Could not resolve origin device path, skipping fstab update"
 else
-    echo "LAS: WARNING - Could not mount root to update fstab"
+    log "Origin device resolved to: $ORIGIN_DEV"
+
+    ROOT_MAPPER="/dev/mapper/{name}{root_part_num}"
+    TEMP_ROOT="/tmp/las_root_$$"
+    mkdir -p "$TEMP_ROOT"
+    MOUNTED=0
+
+    if mount -o ro "$ROOT_MAPPER" "$TEMP_ROOT" 2>/dev/null; then
+        MOUNTED=1
+        log "Root partition mounted from $ROOT_MAPPER"
+    else
+        log "WARNING: Could not mount $ROOT_MAPPER for fstab update"
+    fi
+
+    if [ "$MOUNTED" -eq 1 ]; then
+        FSTAB="$TEMP_ROOT/etc/fstab"
+
+        if [ -f "$FSTAB" ]; then
+            if mount -o remount,rw "$TEMP_ROOT" 2>/dev/null; then
+                cp "$FSTAB" "${{FSTAB}}.pre-las" 2>/dev/null || true
+
+{fstab_sed_block}
+
+                log "Updated /etc/fstab:"
+                grep -v '^#' "$FSTAB" | grep -v '^$' | while IFS= read -r _line; do log "  fstab: $_line"; done || true
+
+                sync
+            else
+                log "WARNING: Could not remount root rw for fstab update"
+            fi
+        else
+            log "WARNING: /etc/fstab not found in root filesystem"
+        fi
+
+        umount "$TEMP_ROOT" 2>/dev/null || log "WARNING: umount of $TEMP_ROOT failed"
+    fi
+
+    rm -rf "$TEMP_ROOT" 2>/dev/null || true
 fi
 
-rm -rf "$TEMP_ROOT"
-
-# 4. Final Announcement
+# Announce mapper devices to udev
 udevadm trigger --action=add /dev/mapper/{name}* || true
 udevadm settle --timeout=10
-echo "LAS: Mapper hierarchy ready. Recovery running in background at {rate} KiB/s."
-echo "LAS: RAID device: /dev/mapper/{name} with $MAPPED partition(s)"
+
+ASSEMBLY_OK=1
+trap - EXIT
+log "Assembly complete: /dev/mapper/{name} with $MAPPED partition(s)"
+log "RAID sync running in background at {rate} KiB/s (max {max_rate} KiB/s)"
 """
 
     hook_filename = f"99-las-assemble-{name}.sh"
     tmp_hook_path = os.path.join("/tmp", hook_filename)
-    
+
     try:
         with open(tmp_hook_path, "w") as f:
             f.write(hook_content)
@@ -280,27 +360,37 @@ echo "LAS: RAID device: /dev/mapper/{name} with $MAPPED partition(s)"
 
         kver = subprocess.check_output(['uname', '-r'], text=True).strip()
         migration_img = f"/boot/initramfs-las-{name}.img"
-        
+
         print(f"[*] Generating LAS Initramfs: {migration_img}")
-        
-        # Build command: Install tools needed for device conflict prevention
+
         cmd = [
             'sudo', 'dracut', '--force',
             '--add', 'dm',
             '--add-drivers', 'dm-raid raid1',
-            '--install', 'dmsetup blockdev udevadm btrfs partx lsblk',
-            '--include', tmp_hook_path, f'/usr/lib/dracut/hooks/pre-mount/{hook_filename}',
+            '--install', 'dmsetup blockdev udevadm btrfs partx lsblk blkid',
+            '--include', tmp_hook_path,
+            f'/usr/lib/dracut/hooks/pre-mount/{hook_filename}',
             migration_img, kver
         ]
-        
-        # Removed capture_output so you can see dracut progress and avoid 'tofu' hangs
+
         subprocess.run(cmd, check=True)
-        
         subprocess.run(['sync'], check=True)
+
+        if not os.path.exists(migration_img):
+            print(f"[!] Dracut reported success but {migration_img} does not exist")
+            return None
+
+        img_size = os.path.getsize(migration_img)
+        if img_size < 10 * 1024 * 1024:
+            print(f"[!] WARNING: Initramfs is suspiciously small "
+                  f"({img_size // 1024} KB) - may be missing modules")
+        else:
+            print(f"[*] Initramfs size: {img_size // (1024*1024)} MB")
+
         return migration_img
 
     except subprocess.CalledProcessError as e:
-        print(f"[!] Dracut failed.")
+        print(f"[!] Dracut failed: {e}")
         return None
     
 def inject_lvm_assembly_hook(name, p_orig, p_dest, p_m_orig, p_m_dest, vg_name, throttle_kibs=3072):
